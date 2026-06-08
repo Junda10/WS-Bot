@@ -18,6 +18,13 @@ module.exports = {
   // Comma-separated WhatsApp user IDs allowed to call !website
   websiteWhitelist: (process.env.WEBSITE_WHITELIST || '').split(',').map(s => s.trim()).filter(Boolean),
 
+  // Smart-reply debounce: wait this many ms after a user's last message before processing.
+  // Multiple messages within the window are merged (joined with newline) and answered once.
+  // Applies only to the smart-reply / clarification path — ! commands still fire instantly.
+  smartReply: {
+    debounceMs: parseInt(process.env.SMART_REPLY_DEBOUNCE_MS || '15000', 10),
+  },
+
   // Clarification (ask-user / slot-filling) module
   // When enabled, ambiguous user questions trigger structured option-based clarification
   // instead of going straight to smartReply.

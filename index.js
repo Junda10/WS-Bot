@@ -23,6 +23,10 @@ const client = new Client({
 const autoReplyTracker = new Map();
 const COOLDOWN_MS = 12 * 60 * 60 * 1000;
 
+// Per-user smart-reply debounce buffer.
+// Map<userId, { messages: string[], lastMessage, timer }>
+const smartReplyBuffers = new Map();
+
 console.log('🤖 WhatsApp AI新闻机器人启动中...');
 console.log(`🧠 AI模型: ${process.env.OPENROUTER_MODEL || 'not set'}`);
 
@@ -205,10 +209,40 @@ client.on('message', async (message) => {
     return;
   }
 
-  if (!message.fromMe && body.length > 1) {
+  if (!message.fromMe && body.length > 0) {
+    const userId = message.author || message.from;
+
+    // The core requirement for this bot is an immediate "ok" auto-reply.
+    // Keep the newer AI smart-reply path available only when AUTO_REPLY_ENABLED=false.
+    if (config.autoReply?.enabled) {
+      await message.reply(config.autoReply.message || 'ok');
+      return;
+    }
+
+    if (body.length <= 1) return;
+
+    const debounceMs = config.smartReply?.debounceMs ?? 15000;
+    const entry = smartReplyBuffers.get(userId) || { messages: [], lastMessage: null, timer: null };
+    entry.messages.push(body);
+    entry.lastMessage = message;
+    if (entry.timer) clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      smartReplyBuffers.delete(userId);
+      const merged = entry.messages.join('\n');
+      processSmartReply(entry.lastMessage, merged, userId).catch(err => {
+        console.error('Smart-reply (debounced) error:', err.message);
+      });
+    }, debounceMs);
+    smartReplyBuffers.set(userId, entry);
+    if (entry.messages.length > 1) {
+      console.log(`[DEBOUNCE user=${userId} buffered=${entry.messages.length} waiting=${debounceMs}ms]`);
+    }
+  }
+});
+
+async function processSmartReply(message, body, userId) {
     try {
       const chat = await message.getChat();
-      const userId = message.author || message.from;
       const clar = config.clarification || {};
       const clarifyOn = clar.enabled && (!clar.whitelist?.length || clar.whitelist.includes(userId));
 
@@ -260,8 +294,7 @@ client.on('message', async (message) => {
     } catch (err) {
       console.error('Smart-reply error:', err.message);
     }
-  }
-});
+}
 
 const CANCEL_RE = /^\s*(算了|取消|不用了|cancel|stop|退出)\s*[。\.!！]*\s*$/i;
 
