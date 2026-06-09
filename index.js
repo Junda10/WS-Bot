@@ -12,6 +12,19 @@ const { classifyIntent, generateOptions } = require('./intent');
 const { getSession, setSession, clearSession, pruneExpired } = require('./session');
 const { getLeaderboard } = require('./leaderboard');
 const { buildWebsite, listSites, deleteSite, MAX_SITES, PUBLIC_HOST } = require('./website-builder');
+const autoreply = require('./autoreply');
+
+// Admin who approves auto-replying to new numbers. Set AUTOREPLY_ADMIN in .env
+// (full international number, e.g. 60XXXXXXXXX; a leading-0 local MY number is
+// auto-converted to +60). NEVER hardcode a real number here — this repo is public.
+// If unset, the per-number gate is disabled and everyone is auto-replied as before.
+function _toIntlMY(raw) {
+  let n = autoreply.normalize(raw);
+  if (n.startsWith('0')) n = '60' + n.slice(1);
+  return n;
+}
+const ADMIN_NUMBER = _toIntlMY(process.env.AUTOREPLY_ADMIN || '');
+const ADMIN_ID = ADMIN_NUMBER ? `${ADMIN_NUMBER}@c.us` : '';
 
 const client = new Client({
   authStrategy: new LocalAuth(),
@@ -87,6 +100,25 @@ function parseDuration(text) {
   const units = { s: 1, m: 60, h: 3600, d: 86400 };
   const seconds = parseInt(m[1], 10) * units[m[2].toLowerCase()];
   return seconds > 0 && seconds <= 7 * 86400 ? seconds : null;
+}
+
+// Notify the admin that a new number messaged, so they can approve/deny auto-reply.
+async function notifyAdminNewNumber(number, name, preview) {
+  const snippet = (preview || '').slice(0, 200);
+  const text =
+    `📩 *新号码来信*\n` +
+    `号码: ${number}\n` +
+    `名称: ${name || '(未知)'}\n` +
+    `内容: ${snippet}\n\n` +
+    `是否自动回复这个人？\n` +
+    `✅ 开启: !ar on ${number}\n` +
+    `🚫 关闭: !ar off ${number}\n` +
+    `📋 查看名单: !ar list`;
+  try {
+    await client.sendMessage(ADMIN_ID, text);
+  } catch (err) {
+    console.error('notifyAdminNewNumber failed:', err.message);
+  }
 }
 
 // Fetch, format, AI-summarize, and reply with one news category.
@@ -219,6 +251,33 @@ client.on('message', async (message) => {
         await message.reply(`📢 已广播到 ${ok}/${groups.length} 个群组`);
         return;
       }
+      // !ar — manage the per-number auto-reply list (admin number only)
+      if (cmd === '!ar' || cmd.startsWith('!ar ')) {
+        const senderNum = autoreply.normalize(message.author || message.from);
+        if (senderNum !== ADMIN_NUMBER) { await message.reply('⛔ 仅管理员可用'); return; }
+        const args = body.slice(3).trim().split(/\s+/).filter(Boolean);
+        const sub = (args[0] || '').toLowerCase();
+        if (sub === 'on' || sub === 'off') {
+          const target = autoreply.normalize(args[1]);
+          if (!target) { await message.reply(`用法: !ar ${sub} <号码>`); return; }
+          autoreply.setStatus(target, sub);
+          await message.reply(`${sub === 'on' ? '✅ 已开启' : '🚫 已关闭'} ${target} 的自动回复`);
+          return;
+        }
+        if (sub === 'list' || sub === 'pending') {
+          const all = autoreply.listAll();
+          const entries = Object.entries(all).filter(([, v]) => sub === 'list' || v.status === 'pending');
+          if (!entries.length) { await message.reply(sub === 'pending' ? '没有待审批的号码' : '名单是空的 🐟'); return; }
+          const lines = entries.map(([num, v]) => {
+            const icon = v.status === 'on' ? '✅' : v.status === 'off' ? '🚫' : '⏳';
+            return `${icon} ${num}${v.name ? ` (${v.name})` : ''} — ${v.status}`;
+          });
+          await message.reply(`📋 *自动回复名单 (${entries.length})*\n━━━━━━━━━━━━━━━━━━\n${lines.join('\n')}`);
+          return;
+        }
+        await message.reply('用法:\n*!ar on <号码>* — 开启自动回复\n*!ar off <号码>* — 关闭\n*!ar list* — 查看全部名单\n*!ar pending* — 查看待审批');
+        return;
+      }
 
       switch (cmd) {
         case '!news': {
@@ -279,7 +338,7 @@ client.on('message', async (message) => {
         }
         case '!help': {
           await message.reply(
-            `🤖 *AI新闻机器人命令*\n━━━━━━━━━━━━━━━━━━\n\n*!news* - 📰 AI总结所有新闻\n*!tech* - 🤖 AI科技新闻\n*!world* - 🌍 世界新闻\n*!car* - 🚗 汽车新闻\n*!property* - 🏠 房产新闻\n*!rank* - 🏆 AI模型排行榜\n*!raw* - 📋 原始新闻\n\n*!ask <问题>* - 🤔 问 AI\n*!translate <内容>* - 🌐 中英互译\n*!weather <城市>* - 🌤️ 查天气\n*!remind <时长> <内容>* - ⏰ 定时提醒 (如 10m)\n\n*!mymemory* - 🧠 查看小W对你的了解\n*!forget* - 🗑️ 清除所有记忆\n*!nosession* - 🗑️ 清除当前多轮对话状态\n*!groups* - 📋 列出所有群组ID\n*!website <描述>* - 🌐 生成网站 (白名单)\n*!websites* - 📋 查看活跃网站\n*!delsite <slug>* - 🗑️ 删除网站 (白名单)\n*!broadcast <消息>* - 📢 广播到群组 (白名单)\n*!help* - ❓ 帮助菜单\n\n💡 发送任何消息，小W会智能回复（并记住你的偏好）\n━━━━━━━━━━━━━━━━━━`
+            `🤖 *AI新闻机器人命令*\n━━━━━━━━━━━━━━━━━━\n\n*!news* - 📰 AI总结所有新闻\n*!tech* - 🤖 AI科技新闻\n*!world* - 🌍 世界新闻\n*!car* - 🚗 汽车新闻\n*!property* - 🏠 房产新闻\n*!rank* - 🏆 AI模型排行榜\n*!raw* - 📋 原始新闻\n\n*!ask <问题>* - 🤔 问 AI\n*!translate <内容>* - 🌐 中英互译\n*!weather <城市>* - 🌤️ 查天气\n*!remind <时长> <内容>* - ⏰ 定时提醒 (如 10m)\n\n*!mymemory* - 🧠 查看小W对你的了解\n*!forget* - 🗑️ 清除所有记忆\n*!nosession* - 🗑️ 清除当前多轮对话状态\n*!groups* - 📋 列出所有群组ID\n*!website <描述>* - 🌐 生成网站 (白名单)\n*!websites* - 📋 查看活跃网站\n*!delsite <slug>* - 🗑️ 删除网站 (白名单)\n*!broadcast <消息>* - 📢 广播到群组 (白名单)\n*!ar* - 🔐 管理自动回复名单 (管理员)\n*!help* - ❓ 帮助菜单\n\n💡 发送任何消息，小W会智能回复（并记住你的偏好）\n━━━━━━━━━━━━━━━━━━`
           );
           return;
         }
@@ -298,6 +357,27 @@ client.on('message', async (message) => {
     if (config.autoReply?.enabled) {
       await message.reply(config.autoReply.message || 'ok');
       return;
+    }
+
+    // Per-number auto-reply gate (individual chats only; groups, admin & owner exempt).
+    // Disabled entirely when no admin is configured (AUTOREPLY_ADMIN unset).
+    if (ADMIN_NUMBER && message.from.endsWith('@c.us')) {
+      const number = autoreply.normalize(message.from);
+      const isAdmin = number === ADMIN_NUMBER;
+      const isOwner = config.myNumber && number === autoreply.normalize(config.myNumber);
+      if (!isAdmin && !isOwner) {
+        const status = autoreply.getStatus(number);
+        if (status === null) {
+          // Brand-new number: notify admin once, stay silent until approved.
+          let name = '';
+          try { const c = await message.getContact(); name = c.pushname || c.name || ''; } catch {}
+          autoreply.markPending(number, name);
+          await notifyAdminNewNumber(number, name, body);
+          return;
+        }
+        if (status !== 'on') return; // 'off' or 'pending' -> do not auto-reply
+        // 'on' -> fall through to the smart-reply path
+      }
     }
 
     if (body.length <= 1) return;
