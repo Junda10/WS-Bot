@@ -8,10 +8,12 @@ const MODELS = [
   'nvidia/nemotron-3-super-120b-a12b:free',
 ];
 
-async function chat(systemPrompt, userMessage) {
+// Core model-chain call. chat() and chatRaw() are thin wrappers over this.
+async function _chat(systemPrompt, userMessage, { maxTokens = 2048, timeout = 45000, clean = true, label = '' } = {}) {
+  const tag = label ? `[${label}] ` : '';
   for (const model of MODELS) {
     try {
-      console.log(`🤖 尝试模型: ${model}`);
+      console.log(`🤖 ${tag}尝试模型: ${model}`);
       const start = Date.now();
       const res = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
@@ -21,30 +23,34 @@ async function chat(systemPrompt, userMessage) {
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userMessage },
           ],
-          max_tokens: 2048,
+          max_tokens: maxTokens,
         },
         {
           headers: {
             Authorization: `Bearer ${API_KEY}`,
             'Content-Type': 'application/json',
           },
-          timeout: 45000,
+          timeout,
         }
       );
       const msg = res.data.choices[0].message;
       let content = msg.content || msg.reasoning || '';
-      content = cleanAIResponse(content);
+      content = clean ? cleanAIResponse(content) : content.trim();
       if (content) {
-        console.log(`✅ ${model} 成功 (${Date.now() - start}ms)`);
+        console.log(`✅ ${tag}${model} 成功 (${Date.now() - start}ms${clean ? '' : `, ${content.length} chars`})`);
         return content;
       }
-      console.log(`⚠️ ${model} 返回空内容，跳过`);
+      console.log(`⚠️ ${tag}${model} 返回空内容，跳过`);
     } catch (err) {
-      console.error(`❌ ${model} 失败: ${err.response?.data?.error?.message || err.message}`);
+      console.error(`❌ ${tag}${model} 失败: ${err.response?.data?.error?.message || err.message}`);
     }
   }
-  console.error('❌ 所有模型都失败了');
+  console.error(`❌ ${tag}所有模型都失败了`);
   return null;
+}
+
+async function chat(systemPrompt, userMessage) {
+  return _chat(systemPrompt, userMessage, { maxTokens: 2048, timeout: 45000, clean: true });
 }
 
 function cleanAIResponse(text) {
@@ -114,40 +120,7 @@ async function extractPreference(userMessage) {
 
 
 async function chatRaw(systemPrompt, userMessage, maxTokens = 4096) {
-  for (const model of MODELS) {
-    try {
-      console.log(`🤖 [raw] 尝试模型: ${model}`);
-      const start = Date.now();
-      const res = await axios.post(
-        'https://openrouter.ai/api/v1/chat/completions',
-        {
-          model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-          ],
-          max_tokens: maxTokens,
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${API_KEY}`,
-            'Content-Type': 'application/json',
-          },
-          timeout: 90000,
-        }
-      );
-      const msg = res.data.choices[0].message;
-      const content = (msg.content || msg.reasoning || '').trim();
-      if (content) {
-        console.log(`✅ [raw] ${model} 成功 (${Date.now() - start}ms, ${content.length} chars)`);
-        return content;
-      }
-      console.log(`⚠️ [raw] ${model} 返回空内容，跳过`);
-    } catch (err) {
-      console.error(`❌ [raw] ${model} 失败: ${err.response?.data?.error?.message || err.message}`);
-    }
-  }
-  return null;
+  return _chat(systemPrompt, userMessage, { maxTokens, timeout: 90000, clean: false, label: 'raw' });
 }
 
 async function answerWithSlots(intent, slots, userText, memoryContext = '') {

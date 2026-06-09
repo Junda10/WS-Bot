@@ -5,9 +5,10 @@ module.exports = {
   myNumber: process.env.MY_NUMBER || '',
   groupId: process.env.GROUP_ID || '',
 
-  // Auto-reply "ok" to anyone who messages you
+  // Legacy "ok" auto-reply. Off by default now — the AI smart-reply + clarification
+  // path handles messages instead. Set AUTO_REPLY_ENABLED=true to restore the old "ok".
   autoReply: {
-    enabled: (process.env.AUTO_REPLY_ENABLED || 'true') === 'true',
+    enabled: (process.env.AUTO_REPLY_ENABLED || 'false') === 'true',
     message: process.env.AUTO_REPLY_MESSAGE || 'ok',
   },
 

@@ -2,9 +2,10 @@ require('dotenv').config();
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const cron = require('node-cron');
+const axios = require('axios');
 const config = require('./config');
 const { fetchNews, formatNewsMessage, getAllNews } = require('./news-fetcher');
-const { summarizeNews, smartReply, extractPreference, answerWithSlots } = require('./ai');
+const { summarizeNews, smartReply, extractPreference, answerWithSlots, chat } = require('./ai');
 const { addFact, trackTopic, getTopTopics, getFactsSummary, clearMemory } = require('./memory');
 const { getReply, setReply } = require('./cache');
 const { classifyIntent, generateOptions } = require('./intent');
@@ -52,10 +53,51 @@ client.on('ready', () => {
 client.on('authenticated', () => console.log('🔐 认证成功'));
 client.on('auth_failure', (msg) => console.error('❌ 认证失败:', msg));
 
+let reinitTimer = null;
+let reinitInProgress = false;
 client.on('disconnected', (reason) => {
   console.log('🔌 断开连接:', reason);
-  client.initialize();
+  // Debounce + guard: avoid a tight re-initialize loop on repeated disconnects.
+  if (reinitInProgress) return;
+  if (reinitTimer) clearTimeout(reinitTimer);
+  reinitTimer = setTimeout(async () => {
+    reinitInProgress = true;
+    try {
+      console.log('♻️ 5秒后重新初始化客户端...');
+      await client.initialize();
+    } catch (err) {
+      console.error('重新初始化失败:', err.message);
+    } finally {
+      reinitInProgress = false;
+    }
+  }, 5000);
 });
+
+const CATEGORY_LOADING = {
+  tech: '⏳ 🧠 AI正在获取AI科技新闻...',
+  world: '⏳ 🧠 AI正在获取世界新闻...',
+  car: '⏳ 🧠 AI正在获取汽车新闻...',
+  property: '⏳ 🧠 AI正在获取房产新闻...',
+};
+
+// Parse '10m' / '2h' / '30s' / '1d' into seconds (cap 7 days). Returns null if unparseable.
+function parseDuration(text) {
+  const m = /^\s*(\d+)\s*([smhd])\s*$/i.exec(text || '');
+  if (!m) return null;
+  const units = { s: 1, m: 60, h: 3600, d: 86400 };
+  const seconds = parseInt(m[1], 10) * units[m[2].toLowerCase()];
+  return seconds > 0 && seconds <= 7 * 86400 ? seconds : null;
+}
+
+// Fetch, format, AI-summarize, and reply with one news category.
+// Shared by the !tech / !world / !car / !property commands.
+async function sendCategoryNews(message, category) {
+  await message.reply(CATEGORY_LOADING[category] || '⏳ 获取新闻中...');
+  const items = await fetchNews(category);
+  const raw = formatNewsMessage(category, items);
+  const summary = await summarizeNews(raw);
+  await message.reply(summary || raw);
+}
 
 client.on('message', async (message) => {
   const body = message.body.trim();
@@ -65,7 +107,6 @@ client.on('message', async (message) => {
     try {
       // !website <description> — generate website (prefix match, preserve original casing for description)
       if (cmd.startsWith('!website ') || cmd === '!website') {
-        const config = require('./config');
         const senderId = message.author || message.from;
         if (!config.websiteWhitelist || !config.websiteWhitelist.includes(senderId)) {
           await message.reply('⛔ 你没有权限使用此功能');
@@ -98,7 +139,6 @@ client.on('message', async (message) => {
         return;
       }
       if (cmd.startsWith('!delsite ')) {
-        const config = require('./config');
         const senderId = message.author || message.from;
         if (!config.websiteWhitelist || !config.websiteWhitelist.includes(senderId)) {
           await message.reply('⛔ 你没有权限使用此功能');
@@ -114,6 +154,72 @@ client.on('message', async (message) => {
         else await message.reply(`🗑️ 已删除网站: ${slug}`);
         return;
       }
+
+      // ── Interactive commands ──────────────────────────────────────────────
+      // !ask <question> — direct AI answer
+      if (cmd.startsWith('!ask ')) {
+        const q = body.slice(4).trim();
+        if (!q) { await message.reply('用法: !ask <问题>'); return; }
+        await message.reply('🤔 思考中...');
+        const ans = await chat('你是一个有帮助的助手，用简洁中文回答用户问题。直接给答案，不要前言，不要思考过程。', q);
+        await message.reply(ans || '😅 暂时答不上来，等下再试');
+        return;
+      }
+      // !translate <text> — auto CN<->EN
+      if (cmd.startsWith('!translate ') || cmd.startsWith('!tr ')) {
+        const text = body.replace(/^!(translate|tr)\s+/i, '').trim();
+        if (!text) { await message.reply('用法: !translate <要翻译的内容>'); return; }
+        const sys = 'You are a translator. If the input is Chinese, translate to natural English; otherwise translate to natural Chinese. Output ONLY the translation, no quotes, no explanation.';
+        const out = await chat(sys, text);
+        await message.reply(out || '翻译失败，等下再试');
+        return;
+      }
+      // !weather <city> — current weather via wttr.in (no API key)
+      if (cmd.startsWith('!weather ') || cmd.startsWith('!天气 ')) {
+        const city = body.replace(/^!(weather|天气)\s+/i, '').trim();
+        if (!city) { await message.reply('用法: !weather <城市>'); return; }
+        try {
+          const res = await axios.get(
+            `https://wttr.in/${encodeURIComponent(city)}?format=%l:+%c+%t+(体感+%f)+💨%w&m&lang=zh`,
+            { timeout: 15000, headers: { 'User-Agent': 'curl' } }
+          );
+          await message.reply(`🌤️ ${String(res.data).trim()}`);
+        } catch (err) {
+          await message.reply('☁️ 查不到这个城市的天气，换个名字试试');
+        }
+        return;
+      }
+      // !remind <dur> <msg> — ping back after a delay
+      if (cmd.startsWith('!remind ')) {
+        const rest = body.slice(8).trim();
+        const m = rest.match(/^(\S+)\s+([\s\S]+)$/);
+        const seconds = m ? parseDuration(m[1]) : null;
+        if (!m || !seconds) { await message.reply('用法: !remind 10m 内容（支持 s/m/h/d，最长 7 天）'); return; }
+        const what = m[2];
+        await message.reply(`⏰ 好，${m[1]} 后提醒你：${what}`);
+        setTimeout(() => { message.reply(`⏰ 提醒时间到：${what}`).catch(() => {}); }, seconds * 1000);
+        return;
+      }
+      // !broadcast <msg> — whitelist-gated send to configured groups
+      if (cmd.startsWith('!broadcast ')) {
+        const senderId = message.author || message.from;
+        if (!config.websiteWhitelist || !config.websiteWhitelist.includes(senderId)) {
+          await message.reply('⛔ 你没有权限使用此功能');
+          return;
+        }
+        const text = body.slice('!broadcast'.length).trim();
+        if (!text) { await message.reply('用法: !broadcast <消息>'); return; }
+        const groups = (process.env.BROADCAST_GROUPS || config.groupId || '')
+          .split(',').map((s) => s.trim()).filter(Boolean);
+        if (!groups.length) { await message.reply('没有配置广播群组（设置 BROADCAST_GROUPS 或 GROUP_ID）'); return; }
+        let ok = 0;
+        for (const g of groups) {
+          try { await client.sendMessage(g, text); ok++; } catch (e) { console.error('broadcast fail', g, e.message); }
+        }
+        await message.reply(`📢 已广播到 ${ok}/${groups.length} 个群组`);
+        return;
+      }
+
       switch (cmd) {
         case '!news': {
           await message.reply('⏳ 🧠 AI正在获取并总结所有新闻...');
@@ -122,36 +228,11 @@ client.on('message', async (message) => {
           await message.reply(summary || rawNews);
           return;
         }
-        case '!tech': {
-          await message.reply('⏳ 🧠 AI正在获取AI科技新闻...');
-          const items = await fetchNews('tech');
-          const raw = formatNewsMessage('tech', items);
-          const summary = await summarizeNews(raw);
-          await message.reply(summary || raw);
-          return;
-        }
-        case '!world': {
-          await message.reply('⏳ 🧠 AI正在获取世界新闻...');
-          const wItems = await fetchNews('world');
-          const wRaw = formatNewsMessage('world', wItems);
-          const wSummary = await summarizeNews(wRaw);
-          await message.reply(wSummary || wRaw);
-          return;
-        }
-        case '!car': {
-          await message.reply('⏳ 🧠 AI正在获取汽车新闻...');
-          const items = await fetchNews('car');
-          const raw = formatNewsMessage('car', items);
-          const summary = await summarizeNews(raw);
-          await message.reply(summary || raw);
-          return;
-        }
+        case '!tech':
+        case '!world':
+        case '!car':
         case '!property': {
-          await message.reply('⏳ 🧠 AI正在获取房产新闻...');
-          const items = await fetchNews('property');
-          const raw = formatNewsMessage('property', items);
-          const summary = await summarizeNews(raw);
-          await message.reply(summary || raw);
+          await sendCategoryNews(message, cmd.slice(1));
           return;
         }
         case '!rank': {
@@ -198,7 +279,7 @@ client.on('message', async (message) => {
         }
         case '!help': {
           await message.reply(
-            `🤖 *AI新闻机器人命令*\n━━━━━━━━━━━━━━━━━━\n\n*!news* - 📰 AI总结所有新闻\n*!tech* - 🤖 AI科技新闻\n*!world* - 🌍 世界新闻\n*!car* - 🚗 汽车新闻\n*!property* - 🏠 房产新闻\n*!rank* - 🏆 AI模型排行榜\n*!raw* - 📋 原始新闻\n*!mymemory* - 🧠 查看小W对你的了解\n*!forget* - 🗑️ 清除所有记忆\n*!nosession* - 🗑️ 清除当前多轮对话状态\n*!groups* - 📋 列出所有群组ID\n*!website <描述>* - 🌐 生成网站 (白名单)\n*!websites* - 📋 查看活跃网站\n*!delsite <slug>* - 🗑️ 删除网站 (白名单)\n*!help* - ❓ 帮助菜单\n\n💡 发送任何消息，小W会智能回复（并记住你的偏好）\n━━━━━━━━━━━━━━━━━━`
+            `🤖 *AI新闻机器人命令*\n━━━━━━━━━━━━━━━━━━\n\n*!news* - 📰 AI总结所有新闻\n*!tech* - 🤖 AI科技新闻\n*!world* - 🌍 世界新闻\n*!car* - 🚗 汽车新闻\n*!property* - 🏠 房产新闻\n*!rank* - 🏆 AI模型排行榜\n*!raw* - 📋 原始新闻\n\n*!ask <问题>* - 🤔 问 AI\n*!translate <内容>* - 🌐 中英互译\n*!weather <城市>* - 🌤️ 查天气\n*!remind <时长> <内容>* - ⏰ 定时提醒 (如 10m)\n\n*!mymemory* - 🧠 查看小W对你的了解\n*!forget* - 🗑️ 清除所有记忆\n*!nosession* - 🗑️ 清除当前多轮对话状态\n*!groups* - 📋 列出所有群组ID\n*!website <描述>* - 🌐 生成网站 (白名单)\n*!websites* - 📋 查看活跃网站\n*!delsite <slug>* - 🗑️ 删除网站 (白名单)\n*!broadcast <消息>* - 📢 广播到群组 (白名单)\n*!help* - ❓ 帮助菜单\n\n💡 发送任何消息，小W会智能回复（并记住你的偏好）\n━━━━━━━━━━━━━━━━━━`
           );
           return;
         }
