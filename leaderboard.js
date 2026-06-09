@@ -1,108 +1,137 @@
 const axios = require('axios');
 
-const OR_API = 'https://openrouter.ai/api/frontend/models/find';
+const OR_API = 'https://openrouter.ai/api/v1/models';
+const SEVEN_DAYS = 7 * 24 * 60 * 60;
 
-async function fetchTopModels(order = 'top-weekly', limit = 10) {
-  try {
-    const res = await axios.get(OR_API, {
-      params: { order },
-      timeout: 15000,
-    });
-    const models = res.data?.data?.models || [];
-    return models
-      .filter((m) => m.output_modalities?.includes('text'))
-      .slice(0, limit)
-      .map((m, i) => ({
-        rank: i + 1,
-        name: m.short_name || m.name,
-        author: m.author_display_name || m.author || '',
-        slug: m.slug,
-        context: m.context_length,
-      }));
-  } catch (err) {
-    console.error('Leaderboard fetch error:', err.message);
-    return [];
-  }
+async function fetchAllModels() {
+  const res = await axios.get(OR_API, { timeout: 15000 });
+  const models = res.data?.data || [];
+  return models.filter((m) => m.architecture?.output_modalities?.includes('text'));
 }
 
-async function fetchNewModels(limit = 10) {
-  try {
-    const res = await axios.get(OR_API, {
-      params: { order: 'newest' },
-      timeout: 15000,
-    });
-    const models = res.data?.data?.models || [];
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    return models
-      .filter((m) => {
-        if (!m.output_modalities?.includes('text')) return false;
-        const created = new Date(m.created_at);
-        return created >= sevenDaysAgo;
-      })
-      .slice(0, limit)
-      .map((m) => ({
-        name: m.short_name || m.name,
-        author: m.author_display_name || m.author || '',
-        slug: m.slug,
-        date: m.created_at?.slice(0, 10) || '',
-        context: m.context_length,
-      }));
-  } catch (err) {
-    console.error('New models fetch error:', err.message);
-    return [];
-  }
+function isFree(m) {
+  const p = m.pricing || {};
+  return p.prompt === '0' && p.completion === '0';
+}
+
+function supportsReasoning(m) {
+  const sp = m.supported_parameters || [];
+  return sp.includes('reasoning') || sp.includes('include_reasoning');
 }
 
 function formatCtx(ctx) {
   if (!ctx) return '';
-  if (ctx >= 1000000) return `${(ctx / 1000000).toFixed(0)}M`;
+  if (ctx >= 1000000) return `${(ctx / 1000000).toFixed(1).replace(/\.0$/, '')}M`;
   if (ctx >= 1000) return `${(ctx / 1000).toFixed(0)}K`;
   return String(ctx);
 }
 
-function formatLeaderboard(topModels, newModels) {
+function modelName(m) {
+  return m.name || m.id;
+}
+
+function modelAuthor(m) {
+  const id = m.id || '';
+  return id.split('/')[0] || '';
+}
+
+function formatDate(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  return d.toISOString().slice(0, 10);
+}
+
+function todayHeader() {
   const now = new Date();
   const yyyy = now.getFullYear();
   const mm = String(now.getMonth() + 1).padStart(2, '0');
   const dd = String(now.getDate()).padStart(2, '0');
   const days = ['日', '一', '二', '三', '四', '五', '六'];
-  const today = `${yyyy}-${mm}-${dd} 星期${days[now.getDay()]}`;
+  return `${yyyy}-${mm}-${dd} 星期${days[now.getDay()]}`;
+}
 
-  let msg = `🏆 *AI模型排行榜*\n📅 *${today}*\n━━━━━━━━━━━━━━━━━━\n\n`;
+function sectionNewModels(models, limit = 7) {
+  const cutoff = Math.floor(Date.now() / 1000) - SEVEN_DAYS;
+  const items = models
+    .filter((m) => m.created && m.created >= cutoff)
+    .sort((a, b) => b.created - a.created)
+    .slice(0, limit);
+  if (!items.length) return '';
+  let s = `🆕 *本周新模型 (7天内)*\n\n`;
+  items.forEach((m, i) => {
+    s += `${i + 1}. *${modelName(m)}*\n`;
+    s += `   ${modelAuthor(m)} · ${formatDate(m.created)} · ${formatCtx(m.context_length)} ctx\n\n`;
+  });
+  return s;
+}
 
-  if (topModels.length > 0) {
-    msg += `🔥 *本周热门 Top 10*\n\n`;
-    const medals = ['🥇', '🥈', '🥉'];
-    topModels.forEach((m) => {
-      const icon = medals[m.rank - 1] || `${m.rank}.`;
-      msg += `${icon} *${m.name}*\n`;
-      msg += `   ${m.author} · ${formatCtx(m.context)} ctx\n\n`;
-    });
-  }
+function sectionNewFreeModels(models, limit = 7) {
+  const cutoff = Math.floor(Date.now() / 1000) - SEVEN_DAYS;
+  const items = models
+    .filter((m) => isFree(m) && m.created && m.created >= cutoff)
+    .sort((a, b) => b.created - a.created)
+    .slice(0, limit);
+  if (!items.length) return '';
+  let s = `🆓 *本周新免费模型*\n\n`;
+  items.forEach((m, i) => {
+    s += `${i + 1}. *${modelName(m)}*\n`;
+    s += `   ${modelAuthor(m)} · ${formatDate(m.created)} · ${formatCtx(m.context_length)} ctx\n\n`;
+  });
+  return s;
+}
 
-  if (newModels.length > 0) {
-    msg += `🆕 *本周新模型*\n\n`;
-    newModels.forEach((m, i) => {
-      msg += `${i + 1}. *${m.name}*\n`;
-      msg += `   ${m.author} · ${m.date} · ${formatCtx(m.context)} ctx\n\n`;
-    });
-  }
+function sectionBigContext(models, limit = 10) {
+  const items = [...models]
+    .filter((m) => m.context_length)
+    .sort((a, b) => (b.context_length || 0) - (a.context_length || 0))
+    .slice(0, limit);
+  if (!items.length) return '';
+  let s = `📊 *最大 Context Top ${limit}*\n\n`;
+  const medals = ['🥇', '🥈', '🥉'];
+  items.forEach((m, i) => {
+    const icon = medals[i] || `${i + 1}.`;
+    s += `${icon} *${modelName(m)}*\n`;
+    s += `   ${modelAuthor(m)} · ${formatCtx(m.context_length)} ctx\n\n`;
+  });
+  return s;
+}
 
-  msg += `📊 来源: OpenRouter\n🔗 openrouter.ai/rankings`;
-  return msg;
+function sectionReasoningModels(models, limit = 7) {
+  const items = models
+    .filter(supportsReasoning)
+    .sort((a, b) => (b.created || 0) - (a.created || 0))
+    .slice(0, limit);
+  if (!items.length) return '';
+  let s = `🧠 *最新支持推理 (Thinking) 的模型*\n\n`;
+  items.forEach((m, i) => {
+    s += `${i + 1}. *${modelName(m)}*\n`;
+    s += `   ${modelAuthor(m)} · ${formatDate(m.created)} · ${formatCtx(m.context_length)} ctx\n\n`;
+  });
+  return s;
 }
 
 async function getLeaderboard() {
-  const [topModels, newModels] = await Promise.all([
-    fetchTopModels('top-weekly', 10),
-    fetchNewModels(10),
-  ]);
-
-  if (topModels.length === 0 && newModels.length === 0) {
+  let models;
+  try {
+    models = await fetchAllModels();
+  } catch (err) {
+    console.error('Leaderboard fetch error:', err.message);
     return '❌ 暂时无法获取排行榜数据，请稍后再试';
   }
+  if (!models.length) return '❌ 暂时无法获取排行榜数据，请稍后再试';
 
-  return formatLeaderboard(topModels, newModels);
+  const sections = [
+    sectionNewModels(models),
+    sectionNewFreeModels(models),
+    sectionBigContext(models),
+    sectionReasoningModels(models),
+  ].filter(Boolean);
+
+  if (!sections.length) return '❌ 暂时无法获取排行榜数据，请稍后再试';
+
+  const header = `🏆 *AI模型排行榜*\n📅 *${todayHeader()}*\n━━━━━━━━━━━━━━━━━━\n\n`;
+  const footer = `📊 来源: OpenRouter\n🔗 openrouter.ai/models`;
+  return header + sections.join('') + footer;
 }
 
-module.exports = { getLeaderboard, fetchTopModels, fetchNewModels };
+module.exports = { getLeaderboard };
