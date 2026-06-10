@@ -401,7 +401,31 @@ client.on('message', async (message) => {
   }
 });
 
+// Anti-ban human pause: pace the reply like a human typing. The target delay scales
+// with the reply length (base thinking time + per-char typing time), is jittered, and
+// clamped to [min, max]. `startedAt` anchors it to when processing began, so AI
+// generation time already counts toward the target (no double-waiting).
+function _typingDelayMs(text) {
+  const s = config.smartReply || {};
+  const base = s.replyDelayBaseMs ?? 1000;
+  const perChar = s.replyDelayPerCharMs ?? 80;
+  const min = s.replyDelayMinMs ?? 2000;
+  const max = s.replyDelayMaxMs ?? 5000;
+  const raw = base + (text ? text.length : 0) * perChar;
+  const jitter = 0.85 + Math.random() * 0.3; // ±15% so it's not metronomic
+  return Math.min(max, Math.max(min, Math.round(raw * jitter)));
+}
+
+async function humanPause(chat, startedAt, replyText) {
+  const wait = _typingDelayMs(replyText) - (Date.now() - startedAt);
+  if (wait > 0) {
+    try { await chat.sendStateTyping(); } catch {}
+    await new Promise((r) => setTimeout(r, wait));
+  }
+}
+
 async function processSmartReply(message, body, userId) {
+    const startedAt = Date.now();
     try {
       const chat = await message.getChat();
       const clar = config.clarification || {};
@@ -429,6 +453,9 @@ async function processSmartReply(message, body, userId) {
 
       const cached = getReply(body);
       if (cached) {
+        // Was an instant reply (ban risk) — pace it like a human typing.
+        await humanPause(chat, startedAt, cached);
+        await chat.clearState();
         await message.reply(cached);
       } else {
         await chat.sendStateTyping();
@@ -440,10 +467,14 @@ async function processSmartReply(message, body, userId) {
         if (topTopics.length) context += `\n常聊话题：${topTopics.join(', ')}`;
 
         const aiReply = await smartReply(body, context);
-        await chat.clearState();
         if (aiReply) {
           setReply(body, aiReply);
+          // Pad to the human delay (AI gen time already counts toward it), typing shown.
+          await humanPause(chat, startedAt, aiReply);
+          await chat.clearState();
           await message.reply(aiReply);
+        } else {
+          await chat.clearState();
         }
       }
 

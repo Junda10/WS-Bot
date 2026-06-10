@@ -23,7 +23,15 @@ module.exports = {
   // Multiple messages within the window are merged (joined with newline) and answered once.
   // Applies only to the smart-reply / clarification path — ! commands still fire instantly.
   smartReply: {
-    debounceMs: parseInt(process.env.SMART_REPLY_DEBOUNCE_MS || '15000', 10),
+    debounceMs: parseInt(process.env.SMART_REPLY_DEBOUNCE_MS || '3000', 10),
+    // Anti-ban: never reply instantly. The reply is paced like a human typing —
+    // delay = base "thinking" time + per-character typing time, scaled by reply
+    // length, jittered, and clamped between min and max. Typical short replies
+    // land ~2-3s, longer ones up to the cap.
+    replyDelayBaseMs: parseInt(process.env.REPLY_DELAY_BASE_MS || '1000', 10),
+    replyDelayPerCharMs: parseInt(process.env.REPLY_DELAY_PER_CHAR_MS || '80', 10),
+    replyDelayMinMs: parseInt(process.env.REPLY_DELAY_MIN_MS || '2000', 10),
+    replyDelayMaxMs: parseInt(process.env.REPLY_DELAY_MAX_MS || '5000', 10),
   },
 
   // Clarification (ask-user / slot-filling) module
