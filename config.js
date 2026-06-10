@@ -12,9 +12,12 @@ module.exports = {
     message: process.env.AUTO_REPLY_MESSAGE || 'ok',
   },
 
-  // Daily news schedule (24h format)
+  // Daily news schedule (24h format). scheduleHour/Minute are interpreted in
+  // scheduleTz, NOT the server's UTC clock — so SCHEDULE_HOUR=12 means noon in MY,
+  // regardless of where the server is hosted.
   scheduleHour: parseInt(process.env.SCHEDULE_HOUR || '8', 10),
   scheduleMinute: parseInt(process.env.SCHEDULE_MINUTE || '0', 10),
+  scheduleTz: process.env.SCHEDULE_TZ || 'Asia/Kuala_Lumpur',
 
   // Comma-separated WhatsApp user IDs allowed to call !website
   websiteWhitelist: (process.env.WEBSITE_WHITELIST || '').split(',').map(s => s.trim()).filter(Boolean),

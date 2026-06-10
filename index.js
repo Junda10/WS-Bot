@@ -58,8 +58,9 @@ client.on('ready', () => {
 
   const min = String(config.scheduleMinute);
   const hr = String(config.scheduleHour);
-  cron.schedule(`${min} ${hr} * * *`, () => sendMorningNews());
-  console.log(`⏰ 每天 ${config.scheduleHour}:${String(config.scheduleMinute).padStart(2, '0')} 自动发送AI新闻摘要`);
+  // Interpret the schedule in scheduleTz (default MY time), not the server's UTC clock.
+  cron.schedule(`${min} ${hr} * * *`, () => sendMorningNews(), { timezone: config.scheduleTz });
+  console.log(`⏰ 每天 ${config.scheduleHour}:${String(config.scheduleMinute).padStart(2, '0')} (${config.scheduleTz}) 自动发送AI新闻摘要`);
 
   // setTimeout(() => {
   //   console.log('📰 首次启动，发送测试新闻...');
