@@ -40,6 +40,10 @@ const COOLDOWN_MS = 12 * 60 * 60 * 1000;
 // Per-user smart-reply debounce buffer.
 // Map<userId, { messages: string[], lastMessage, timer }>
 const smartReplyBuffers = new Map();
+// Users whose reply is currently being generated/sent (incl. the human-typing pause).
+// Serializes replies per user so the multi-second humanPause can't overlap and race
+// on the shared chat typing state or interleave out-of-order replies.
+const replyInFlight = new Set();
 
 console.log('🤖 WhatsApp AI新闻机器人启动中...');
 console.log(`🧠 AI模型: ${process.env.OPENROUTER_MODEL || 'not set'}`);
@@ -254,7 +258,8 @@ client.on('message', async (message) => {
       // !ar — manage the per-number auto-reply list (admin number only)
       if (cmd === '!ar' || cmd.startsWith('!ar ')) {
         const senderNum = autoreply.normalize(message.author || message.from);
-        if (senderNum !== ADMIN_NUMBER) { await message.reply('⛔ 仅管理员可用'); return; }
+        // Require a configured admin AND an exact match (guards the ADMIN_NUMBER='' + senderNum='' bypass).
+        if (!ADMIN_NUMBER || senderNum !== ADMIN_NUMBER) { await message.reply('⛔ 仅管理员可用'); return; }
         const args = body.slice(3).trim().split(/\s+/).filter(Boolean);
         const sub = (args[0] || '').toLowerCase();
         if (sub === 'on' || sub === 'off') {
@@ -368,12 +373,17 @@ client.on('message', async (message) => {
       if (!isAdmin && !isOwner) {
         const status = autoreply.getStatus(number);
         if (status === null) {
-          // Brand-new number: notify admin once, stay silent until approved.
-          let name = '';
-          try { const c = await message.getContact(); name = c.pushname || c.name || ''; } catch {}
-          autoreply.markPending(number, name);
-          await notifyAdminNewNumber(number, name, body);
-          return;
+          // Brand-new number: claim the slot synchronously FIRST (markPending is atomic
+          // and returns true only once), so a near-simultaneous 2nd message from the same
+          // number can't double-notify the admin during the getContact() await below.
+          const isNew = autoreply.markPending(number, '');
+          if (isNew) {
+            let name = '';
+            try { const c = await message.getContact(); name = c.pushname || c.name || ''; } catch {}
+            if (name) autoreply.setStatus(number, 'pending', name);
+            await notifyAdminNewNumber(number, name, body);
+          }
+          return; // stay silent until approved
         }
         if (status !== 'on') return; // 'off' or 'pending' -> do not auto-reply
         // 'on' -> fall through to the smart-reply path
@@ -382,18 +392,26 @@ client.on('message', async (message) => {
 
     if (body.length <= 1) return;
 
-    const debounceMs = config.smartReply?.debounceMs ?? 15000;
+    const debounceMs = config.smartReply?.debounceMs ?? 3000;
     const entry = smartReplyBuffers.get(userId) || { messages: [], lastMessage: null, timer: null };
     entry.messages.push(body);
     entry.lastMessage = message;
     if (entry.timer) clearTimeout(entry.timer);
-    entry.timer = setTimeout(() => {
+    const fire = () => {
+      // A reply for this user is still being sent (humanPause in progress) — wait and
+      // retry instead of launching a concurrent flow that would race the typing state.
+      if (replyInFlight.has(userId)) {
+        entry.timer = setTimeout(fire, 1500);
+        return;
+      }
       smartReplyBuffers.delete(userId);
       const merged = entry.messages.join('\n');
-      processSmartReply(entry.lastMessage, merged, userId).catch(err => {
-        console.error('Smart-reply (debounced) error:', err.message);
-      });
-    }, debounceMs);
+      replyInFlight.add(userId);
+      processSmartReply(entry.lastMessage, merged, userId)
+        .catch(err => console.error('Smart-reply (debounced) error:', err.message))
+        .finally(() => replyInFlight.delete(userId));
+    };
+    entry.timer = setTimeout(fire, debounceMs);
     smartReplyBuffers.set(userId, entry);
     if (entry.messages.length > 1) {
       console.log(`[DEBOUNCE user=${userId} buffered=${entry.messages.length} waiting=${debounceMs}ms]`);
