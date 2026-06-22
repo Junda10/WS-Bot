@@ -2,11 +2,22 @@ const axios = require('axios');
 
 const API_KEY = process.env.OPENROUTER_API_KEY;
 
-const MODELS = [
-  'openai/gpt-oss-120b:free',
-  'z-ai/glm-4.5-air:free',
+// OpenRouter free-model fallback chain.
+// Keep this list fresh because free model IDs are occasionally removed/renamed.
+// OPENROUTER_MODEL can be set in .env to force a preferred first choice.
+const DEFAULT_MODELS = [
+  // Prefer the newest high-quality general model; code-only models are kept as fallbacks.
+  'nvidia/nemotron-3-ultra-550b-a55b:free',
   'nvidia/nemotron-3-super-120b-a12b:free',
+  'openai/gpt-oss-120b:free',
+  'openrouter/free',
+  'cohere/north-mini-code:free',
+  'nex-agi/nex-n2-pro:free',
 ];
+
+const MODELS = [process.env.OPENROUTER_MODEL, ...DEFAULT_MODELS]
+  .filter(Boolean)
+  .filter((model, index, arr) => arr.indexOf(model) === index);
 
 // Persona for the smart-reply (chat) path: the bot replies AS Dery, not as an assistant.
 const DERY_PERSONA = `你就是 Dery 本人在用 WhatsApp 回消息。你不是助手、不是 AI、不是客服——你就是 Dery，用我的语气替我回朋友。
@@ -100,27 +111,35 @@ async function summarizeNews(rawNews) {
   const days = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
   const today = `${yyyy}-${mm}-${dd} ${days[now.getDay()]}`;
 
-  const system = `你是一个专业的中文新闻编辑。今天是 ${today}。
+  const system = `你是一个严谨的中文新闻整理员。今天是 ${today}。
 
-任务：将用户提供的新闻整理成简洁清晰的每日新闻摘要。
+你只能根据用户提供的新闻标题和链接整理输出；用户没有提供正文，所以禁止补充任何标题以外的细节。
 
 格式要求（严格遵守）：
 1. 开头写: 📰 *每日新闻摘要*
 2. 第二行写: 📅 ${today}
 3. 空一行后按分类整理新闻
-4. 每个分类用原有的emoji标题（🤖 AI科技、🌍世界新闻、🚗汽车、🏠房产）
-5. 每条新闻格式：
-   序号. *新闻标题中文翻译*
-   简短总结（1句话，最多30字）
-   🔗 链接
+4. 分类标题固定为：🤖 AI科技、🌍 世界新闻、🚗 汽车新闻、🏠 房产新闻
+5. 每条新闻只输出两行：
+   序号. *新闻标题的忠实中文翻译*（保留来源名，例如 - Reuters / - BBC / - Paul Tan）
+   🔗 原链接
 
 重要规则：
-- 每条新闻必须保留🔗链接，链接单独一行
-- 全部用中文，英文标题翻译成中文
-- 不要输出思考过程，直接输出新闻摘要
-- 不要加任何解释或前言`;
+- 必须保留原分类、原顺序、原数量、原链接；不要新增、删除、合并新闻。
+- 只翻译标题，不要写“简短总结/背景/影响/原因”。
+- 不要把标题没有明说的内容写进去；例如不要自行补“夺冠/世锦赛/合作细节/员工福利”等。
+- 如果标题本身像旧年份车型（如 2022/2023 款），照实保留，不要解释为最新上市。
+- 不要输出思考过程，直接输出新闻列表。`;
 
-  return await chat(system, rawNews);
+  const out = await chat(system, rawNews);
+  // Some free/code models occasionally leak instruction analysis instead of the final
+  // news list. If that happens, return null so callers fall back to rawNews rather
+  // than sending a confusing internal monologue to WhatsApp.
+  if (out && /\b(guidelines|instructions?|Interpretation|Thus output|Need to|Blank line)\b/i.test(out)) {
+    console.warn('⚠️ News summary looked like leaked reasoning; falling back to raw news');
+    return null;
+  }
+  return out;
 }
 
 async function smartReply(userMessage, userContext = '') {

@@ -75,7 +75,7 @@ All configuration is driven by `.env` (see `.env.example`). `config.js` is just 
 | Env var | Purpose | Default |
 |---|---|---|
 | `OPENROUTER_API_KEY` | OpenRouter key for LLM calls | (required) |
-| `OPENROUTER_MODEL` | Default model id | `nvidia/nemotron-3-super-120b-a12b:free` |
+| `OPENROUTER_MODEL` | Optional preferred OpenRouter model id (tried before the built-in free-model fallback chain) | unset |
 | `MY_NUMBER` | Your own WhatsApp number | (required) |
 | `GROUP_ID` | Target group for morning broadcast | (required) |
 | `WEBSITE_WHITELIST` | JIDs allowed to call `!website` | empty |
