@@ -2,7 +2,7 @@ const axios = require('axios');
 
 const AA_MODELS_URL = 'https://artificialanalysis.ai/models';
 
-async function fetchArtificialAnalysisIntelligence() {
+async function fetchArtificialAnalysisData() {
   const res = await axios.get(AA_MODELS_URL, {
     timeout: 20000,
     headers: {
@@ -14,6 +14,7 @@ async function fetchArtificialAnalysisIntelligence() {
   const html = String(res.data || '');
   const scripts = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/g) || [];
 
+  const latestReleases = extractLatestReleases(html);
   let bestDataset = [];
   for (const script of scripts) {
     const jsonText = script
@@ -42,8 +43,49 @@ async function fetchArtificialAnalysisIntelligence() {
     }
   }
 
-  if (bestDataset.length) return bestDataset;
+  if (bestDataset.length) return { intelligence: bestDataset, latestReleases };
   throw new Error('Artificial Analysis intelligence dataset not found');
+}
+
+function lastRegexMatch(text, regex) {
+  let last = null;
+  for (const match of text.matchAll(regex)) last = match;
+  return last;
+}
+
+function firstRegexMatch(text, regex) {
+  const match = text.match(regex);
+  return match || null;
+}
+
+function extractLatestReleases(html) {
+  const releaseRegex = /\\"release_date\\":\\"(\d{4}-\d{2}-\d{2})\\"/g;
+  const releasesBySlug = new Map();
+
+  for (const releaseMatch of html.matchAll(releaseRegex)) {
+    const date = releaseMatch[1];
+    const before = html.slice(Math.max(0, releaseMatch.index - 60000), releaseMatch.index);
+    const after = html.slice(releaseMatch.index, releaseMatch.index + 3000);
+
+    const nameMatch = lastRegexMatch(before, /\\"name\\":\\"([^\\"]+)\\"/g);
+    const shortNameMatch = firstRegexMatch(after, /\\"short_name\\":\\"([^\\"]+)\\"/);
+    const slugMatch = firstRegexMatch(after, /\\"slug\\":\\"([^\\"]+)\\"/);
+    const creatorMatch = firstRegexMatch(after, /\\"model_creators\\":\{[\s\S]*?\\"name\\":\\"([^\\"]+)\\"/);
+
+    const rawName = nameMatch?.[1];
+    const slug = slugMatch?.[1];
+    if (!rawName || !slug) continue;
+    if (['Artificial Analysis', 'Intelligence', 'Speed', 'Cost per Task'].includes(rawName)) continue;
+
+    releasesBySlug.set(slug, {
+      date,
+      label: shortNameMatch?.[1] || rawName,
+      creator: creatorMatch?.[1] || '',
+      detailsUrl: `/models/${slug}`,
+    });
+  }
+
+  return [...releasesBySlug.values()].sort((a, b) => b.date.localeCompare(a.date));
 }
 
 function formatScore(score) {
@@ -57,6 +99,23 @@ function todayHeader() {
   const dd = String(now.getDate()).padStart(2, '0');
   const days = ['日', '一', '二', '三', '四', '五', '六'];
   return `${yyyy}-${mm}-${dd} 星期${days[now.getDay()]}`;
+}
+
+function sectionLatestReleases(models, limit = 5) {
+  const items = models.slice(0, limit);
+  if (!items.length) return '';
+
+  let s = `🆕 *Latest Release Models Top ${limit}*\n`;
+  s += `_按 Artificial Analysis 记录的 release date 排序_\n\n`;
+
+  items.forEach((m, i) => {
+    const url = m.detailsUrl ? `https://artificialanalysis.ai${m.detailsUrl}` : '';
+    s += `${i + 1}. *${m.label}*\n`;
+    s += `   ${m.creator ? `${m.creator} · ` : ''}${m.date}`;
+    if (url) s += ` · ${url}`;
+    s += `\n\n`;
+  });
+  return s;
 }
 
 function sectionTopIntelligence(models, limit = 10) {
@@ -77,18 +136,18 @@ function sectionTopIntelligence(models, limit = 10) {
 }
 
 async function getLeaderboard() {
-  let models;
+  let data;
   try {
-    models = await fetchArtificialAnalysisIntelligence();
+    data = await fetchArtificialAnalysisData();
   } catch (err) {
     console.error('Leaderboard fetch error:', err.message);
     return '❌ 暂时无法获取 Artificial Analysis 排行榜数据，请稍后再试';
   }
-  if (!models.length) return '❌ 暂时无法获取 Artificial Analysis 排行榜数据，请稍后再试';
+  if (!data.intelligence.length) return '❌ 暂时无法获取 Artificial Analysis 排行榜数据，请稍后再试';
 
   const header = `🏆 *AI Top Models 排行榜*\n📅 *${todayHeader()}*\n━━━━━━━━━━━━━━━━━━\n\n`;
   const footer = `📊 来源: Artificial Analysis\n🔗 artificialanalysis.ai/models`;
-  return header + sectionTopIntelligence(models) + footer;
+  return header + sectionLatestReleases(data.latestReleases) + sectionTopIntelligence(data.intelligence) + footer;
 }
 
 module.exports = { getLeaderboard };
