@@ -75,7 +75,7 @@ All configuration is driven by `.env` (see `.env.example`). `config.js` is just 
 | Env var | Purpose | Default |
 |---|---|---|
 | `OPENROUTER_API_KEY` | OpenRouter key for LLM calls | (required) |
-| `OPENROUTER_MODEL` | Optional preferred OpenRouter model id (tried before the built-in free-model fallback chain) | unset |
+| `OPENROUTER_MODEL` | Optional preferred OpenRouter model id (tried before the built-in GLM/Z.AI fallback chain) | unset |
 | `MY_NUMBER` | Your own WhatsApp number | (required) |
 | `GROUP_ID` | Target group for morning broadcast | (required) |
 | `WEBSITE_WHITELIST` | JIDs allowed to call `!website` | empty |

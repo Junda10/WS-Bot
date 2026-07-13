@@ -2,17 +2,18 @@ const axios = require('axios');
 
 const API_KEY = process.env.OPENROUTER_API_KEY;
 
-// OpenRouter free-model fallback chain.
-// Keep this list fresh because free model IDs are occasionally removed/renamed.
+// OpenRouter GLM/Z.AI fallback chain (聊天、智能回复、新闻总结、汇率分析都统一走这里)。
+// Keep OpenRouter as provider because deployment uses an OpenRouter key, but avoid
+// the weaker free-model chain for normal replies.
 // OPENROUTER_MODEL can be set in .env to force a preferred first choice.
+// 最后更新 2026-07-13：对着 openrouter.ai/api/v1/models 选择 GLM 付费模型。
+// 顺序 = 优先级：glm-4.5-air 便宜且比免费链聪明；glm-5.2 只做强力兜底。
 const DEFAULT_MODELS = [
-  // Prefer the newest high-quality general model; code-only models are kept as fallbacks.
-  'nvidia/nemotron-3-ultra-550b-a55b:free',
-  'nvidia/nemotron-3-super-120b-a12b:free',
-  'openai/gpt-oss-120b:free',
-  'openrouter/free',
-  'cohere/north-mini-code:free',
-  'nex-agi/nex-n2-pro:free',
+  'z-ai/glm-4.5-air',    // ✅ 主力：便宜、快，质量明显高于免费链
+  'z-ai/glm-4.7-flash',  // ✅ 极便宜回退
+  'z-ai/glm-4.6',        // ✅ 稳定 GLM 回退
+  'z-ai/glm-4.5',        // ✅ 旧版强模型回退
+  'z-ai/glm-5.2',        // ✅ 强力兜底，前面都失败才用
 ];
 
 const MODELS = [process.env.OPENROUTER_MODEL, ...DEFAULT_MODELS]
@@ -49,21 +50,34 @@ const DERY_PERSONA = `你就是 Dery 本人在用 WhatsApp 回消息。你不是
 - 有人发无聊或好笑的东西 →「oh 有空了哦 哈哈哈 这个好笑」`;
 
 // Core model-chain call. chat() and chatRaw() are thin wrappers over this.
-async function _chat(systemPrompt, userMessage, { maxTokens = 2048, timeout = 45000, clean = true, label = '' } = {}) {
+async function _chat(systemPrompt, userMessage, { maxTokens = 2048, timeout = 45000, clean = true, label = '', history = null } = {}) {
   const tag = label ? `[${label}] ` : '';
+  // 组装 messages：系统提示 + 可选历史多轮（合并连续同角色，兼容不接受连续 user 的模型）。
+  const messages = [{ role: 'system', content: systemPrompt }];
+  if (Array.isArray(history) && history.length) {
+    for (const h of history) {
+      const last = messages[messages.length - 1];
+      if (last && last.role === h.role && h.role !== 'system') last.content += `\n${h.content}`;
+      else messages.push({ role: h.role, content: h.content });
+    }
+    // 历史末尾应为当前用户消息；若不是且传了 userMessage，补上
+    if (userMessage && messages[messages.length - 1].role !== 'user') {
+      messages.push({ role: 'user', content: userMessage });
+    }
+  } else {
+    messages.push({ role: 'user', content: userMessage });
+  }
   for (const model of MODELS) {
     try {
-      console.log(`🤖 ${tag}尝试模型: ${model}`);
+      console.log(`🤖 ${tag}尝试模型: ${model}${history ? ` (含${messages.length - 1}轮上下文)` : ''}`);
       const start = Date.now();
       const res = await axios.post(
         'https://openrouter.ai/api/v1/chat/completions',
         {
           model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userMessage },
-          ],
+          messages,
           max_tokens: maxTokens,
+          reasoning: { enabled: false },
         },
         {
           headers: {
@@ -74,7 +88,7 @@ async function _chat(systemPrompt, userMessage, { maxTokens = 2048, timeout = 45
         }
       );
       const msg = res.data.choices[0].message;
-      let content = msg.content || msg.reasoning || '';
+      let content = msg.content || '';
       content = clean ? cleanAIResponse(content) : content.trim();
       if (content) {
         console.log(`✅ ${tag}${model} 成功 (${Date.now() - start}ms${clean ? '' : `, ${content.length} chars`})`);
@@ -142,13 +156,21 @@ async function summarizeNews(rawNews) {
   return out;
 }
 
-async function smartReply(userMessage, userContext = '') {
+async function smartReply(userMessage, userContext = '', history = null) {
   const contextBlock = userContext
     ? `\n\n你对这个用户的了解：\n${userContext}\n根据这些了解来个性化你的回复，但不要直接说"我知道你喜欢…"，自然地融入对话。`
     : '';
 
-  const system = `${DERY_PERSONA}${contextBlock}`;
+  const histNote = Array.isArray(history) && history.length
+    ? `\n\n下面是最近的对话记录（可能是群聊，含发言人名字），请结合上下文自然地回复最新一条消息，不要重复别人说过的话。`
+    : '';
 
+  const system = `${DERY_PERSONA}${contextBlock}${histNote}`;
+
+  // 有历史 → 走多轮上下文；否则单轮。
+  if (Array.isArray(history) && history.length) {
+    return await _chat(system, userMessage, { maxTokens: 2048, timeout: 45000, clean: true, history });
+  }
   return await chat(system, userMessage);
 }
 
