@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node -e \"require('./news-fetcher'); console.log('OK')\""
+    "test": "node -e \"require('./news-fetcher'); console.log('OK')\" && node test/security-regressions.js"
   },
   "keywords": [],
   "author": "",

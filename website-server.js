@@ -8,6 +8,15 @@ const PORT = 8080;
 
 const app = express();
 
+function escapeHtml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 app.get('/', (req, res) => {
   let meta = [];
   try {
@@ -16,8 +25,12 @@ app.get('/', (req, res) => {
 
   const items = meta
     .map(
-      (s) =>
-        `<li><a href="/${s.slug}/">${s.slug}</a> — <em>${s.description || ''}</em> <small>(${new Date(s.createdAt).toLocaleString()})</small></li>`
+      (s) => {
+        const slug = String(s.slug ?? '');
+        const href = `/${encodeURIComponent(slug)}/`;
+        const createdAt = new Date(s.createdAt).toLocaleString();
+        return `<li><a href="${escapeHtml(href)}">${escapeHtml(slug)}</a> — <em>${escapeHtml(s.description)}</em> <small>(${escapeHtml(createdAt)})</small></li>`;
+      }
     )
     .join('\n');
 
@@ -32,6 +45,10 @@ ${items ? `<ul>${items}</ul>` : '<p>No active sites yet.</p>'}
 
 app.use(express.static(SITES_DIR, { index: 'index.html', extensions: ['html'] }));
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🌐 Website server listening on http://0.0.0.0:${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🌐 Website server listening on http://0.0.0.0:${PORT}`);
+  });
+}
+
+module.exports = { app, escapeHtml };

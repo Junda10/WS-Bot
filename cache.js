@@ -33,9 +33,15 @@ function normalize(text) {
     .trim();
 }
 
-function getReply(question) {
+function scopedKey(question, scope) {
+  const normalized = normalize(question);
+  return scope ? `${scope}\u0000${normalized}` : normalized;
+}
+
+function getReply(question, scope = '') {
   const cache = loadCache();
-  const key = normalize(question);
+  const normalized = normalize(question);
+  const key = scopedKey(question, scope);
   const now = Date.now();
 
   if (cache[key] && now - cache[key].time < TTL_MS) {
@@ -46,7 +52,10 @@ function getReply(question) {
 
   for (const [k, v] of Object.entries(cache)) {
     if (now - v.time >= TTL_MS) continue;
-    if (similarity(key, k) > 0.75) {
+    // Scoped lookups must never reuse legacy or another conversation's replies.
+    if (scope && v.scope !== scope) continue;
+    const candidate = v.normalized || (scope ? '' : k);
+    if (candidate && similarity(normalized, candidate) > 0.75) {
       v.hits = (v.hits || 0) + 1;
       saveCache(cache);
       return v.reply;
@@ -56,11 +65,12 @@ function getReply(question) {
   return null;
 }
 
-function setReply(question, reply) {
+function setReply(question, reply, scope = '') {
   const cache = loadCache();
-  const key = normalize(question);
+  const normalized = normalize(question);
+  const key = scopedKey(question, scope);
 
-  cache[key] = { reply, time: Date.now(), hits: 0 };
+  cache[key] = { reply, time: Date.now(), hits: 0, scope, normalized };
 
   const entries = Object.entries(cache);
   if (entries.length > MAX_ENTRIES) {

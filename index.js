@@ -470,7 +470,9 @@ async function processSmartReply(message, body, userId) {
         }
       }
 
-      const cached = getReply(body);
+      // Cache by both conversation and sender: replies can contain user facts and chat history.
+      const cacheScope = `${message.from}:${userId}`;
+      const cached = getReply(body, cacheScope);
       if (cached) {
         // Was an instant reply (ban risk) — pace it like a human typing.
         await humanPause(chat, startedAt, cached);
@@ -487,7 +489,7 @@ async function processSmartReply(message, body, userId) {
 
         const aiReply = await smartReply(body, context);
         if (aiReply) {
-          setReply(body, aiReply);
+          setReply(body, aiReply, cacheScope);
           // Pad to the human delay (AI gen time already counts toward it), typing shown.
           await humanPause(chat, startedAt, aiReply);
           await chat.clearState();
