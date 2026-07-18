@@ -19,6 +19,27 @@ module.exports = {
   scheduleMinute: parseInt(process.env.SCHEDULE_MINUTE || '0', 10),
   scheduleTz: process.env.SCHEDULE_TZ || 'Asia/Kuala_Lumpur',
 
+  // 每日健身教练提醒。默认开启，中午 12:00（scheduleTz 时区，默认大马时间）
+  // 把当天训练/休息计划发给自己。FITNESS_TARGET 可指定接收方 WhatsApp ID，
+  // 留空则默认发给 myNumber 本人（myNumber@c.us）。
+  fitness: {
+    enabled: (process.env.FITNESS_ENABLED || 'true') === 'true',
+    hour: parseInt(process.env.FITNESS_HOUR || '12', 10),
+    minute: parseInt(process.env.FITNESS_MINUTE || '0', 10),
+    target: process.env.FITNESS_TARGET || '',
+  },
+
+  // 每日汇率推送（USD→MYR / SGD→MYR live + 7天高低 + 兑换建议 + AI走势）。
+  // 默认开启，晚上 20:00（scheduleTz 时区）发到群组。FX_TARGET 可覆盖接收方，
+  // 留空则发到 groupId，无群则发给 myNumber 本人。FX_AI=false 可关闭 AI 走势分析。
+  fx: {
+    enabled: (process.env.FX_ENABLED || 'true') === 'true',
+    hour: parseInt(process.env.FX_HOUR || '20', 10),
+    minute: parseInt(process.env.FX_MINUTE || '0', 10),
+    target: process.env.FX_TARGET || '',
+    ai: (process.env.FX_AI || 'true') === 'true',
+  },
+
   // Comma-separated WhatsApp user IDs allowed to call !website
   websiteWhitelist: (process.env.WEBSITE_WHITELIST || '').split(',').map(s => s.trim()).filter(Boolean),
 

@@ -13,6 +13,9 @@ const { getSession, setSession, clearSession, pruneExpired } = require('./sessio
 const { getLeaderboard } = require('./leaderboard');
 const { buildWebsite, listSites, deleteSite, MAX_SITES, PUBLIC_HOST } = require('./website-builder');
 const autoreply = require('./autoreply');
+const workout = require('./workout');
+const fx = require('./fx');
+const history = require('./history');
 const { createMessageDeduper } = require('./message-deduper');
 
 // Admin who approves auto-replying to new numbers. Set AUTOREPLY_ADMIN in .env
@@ -72,6 +75,22 @@ client.on('ready', () => {
   // Interpret the schedule in scheduleTz (default MY time), not the server's UTC clock.
   cron.schedule(`${min} ${hr} * * *`, () => sendMorningNews(), { timezone: config.scheduleTz });
   console.log(`⏰ 每天 ${config.scheduleHour}:${String(config.scheduleMinute).padStart(2, '0')} (${config.scheduleTz}) 自动发送AI新闻摘要`);
+
+  // 每日健身教练提醒（默认中午 12:00 大马时间，把当天训练/休息计划发给自己）。
+  if (config.fitness?.enabled) {
+    const fMin = String(config.fitness.minute);
+    const fHr = String(config.fitness.hour);
+    cron.schedule(`${fMin} ${fHr} * * *`, () => sendFitnessReminder(), { timezone: config.scheduleTz });
+    console.log(`🏋️ 每天 ${config.fitness.hour}:${String(config.fitness.minute).padStart(2, '0')} (${config.scheduleTz}) 自动发送健身提醒`);
+  }
+
+  // 每日汇率推送（默认晚上 20:00 大马时间发到群组）。
+  if (config.fx?.enabled) {
+    const xMin = String(config.fx.minute);
+    const xHr = String(config.fx.hour);
+    cron.schedule(`${xMin} ${xHr} * * *`, () => sendFxUpdate(), { timezone: config.scheduleTz });
+    console.log(`💱 每天 ${config.fx.hour}:${String(config.fx.minute).padStart(2, '0')} (${config.scheduleTz}) 自动发送汇率推送`);
+  }
 
   // setTimeout(() => {
   //   console.log('📰 首次启动，发送测试新闻...');
@@ -162,6 +181,12 @@ client.on('message', async (message) => {
   const body = message.body.trim();
   const cmd = body.toLowerCase();
 
+  // 记录进对话上下文（命令、空消息、bot 自己发的不记）。用轻量的 notifyName，避免每条都 getContact。
+  if (!message.fromMe && body && !body.startsWith('!')) {
+    const name = message._data?.notifyName || (message.author || '').split('@')[0] || '';
+    history.appendUser(message.from, name, body);
+  }
+
   if (cmd.startsWith('!')) {
     try {
       // !website <description> — generate website (prefix match, preserve original casing for description)
@@ -246,6 +271,27 @@ client.on('message', async (message) => {
         } catch (err) {
           await message.reply('☁️ 查不到这个城市的天气，换个名字试试');
         }
+        return;
+      }
+      // !健身 / !fitness — 健身教练：今日计划 / 整周计划 / 某天详情
+      if (cmd === '!健身' || cmd === '!fitness' || cmd === '!workout' || cmd === '!gym'
+          || cmd.startsWith('!健身 ') || cmd.startsWith('!fitness ') || cmd.startsWith('!workout ') || cmd.startsWith('!gym ')) {
+        const arg = body.replace(/^!(健身|fitness|workout|gym)\s*/i, '').trim().toLowerCase();
+        if (arg === '周' || arg === 'week' || arg === 'w') {
+          await message.reply(workout.weekMessage());
+        } else if (['a', 'b', 'c'].includes(arg)) {
+          await message.reply(workout.formatWorkout(arg.toUpperCase()));
+        } else {
+          await message.reply(workout.todayMessage(config.scheduleTz));
+        }
+        return;
+      }
+      // !汇率 / !fx — live 汇率 + 7天高低 + 兑换建议 + AI走势
+      if (cmd === '!汇率' || cmd === '!fx' || cmd === '!rate' || cmd === '!fx ai' || cmd === '!汇率 ai') {
+        await message.reply('💱 获取实时汇率中...');
+        const withAI = cmd.endsWith(' ai') || config.fx?.ai !== false;
+        const text = await fx.buildMessage({ withAI });
+        await message.reply(text);
         return;
       }
       // !remind <dur> <msg> — ping back after a delay
@@ -366,7 +412,7 @@ client.on('message', async (message) => {
         }
         case '!help': {
           await message.reply(
-            `🤖 *AI新闻机器人命令*\n━━━━━━━━━━━━━━━━━━\n\n*!news* - 📰 AI总结所有新闻\n*!tech* - 🤖 AI科技新闻\n*!world* - 🌍 世界新闻\n*!car* - 🚗 汽车新闻\n*!property* - 🏠 房产新闻\n*!rank* - 🏆 AI模型排行榜\n*!raw* - 📋 原始新闻\n\n*!ask <问题>* - 🤔 问 AI\n*!translate <内容>* - 🌐 中英互译\n*!weather <城市>* - 🌤️ 查天气\n*!remind <时长> <内容>* - ⏰ 定时提醒 (如 10m)\n\n*!mymemory* - 🧠 查看小W对你的了解\n*!forget* - 🗑️ 清除所有记忆\n*!nosession* - 🗑️ 清除当前多轮对话状态\n*!groups* - 📋 列出所有群组ID\n*!website <描述>* - 🌐 生成网站 (白名单)\n*!websites* - 📋 查看活跃网站\n*!delsite <slug>* - 🗑️ 删除网站 (白名单)\n*!broadcast <消息>* - 📢 广播到群组 (白名单)\n*!ar* - 🔐 管理自动回复名单 (管理员)\n*!help* - ❓ 帮助菜单\n\n💡 发送任何消息，小W会智能回复（并记住你的偏好）\n━━━━━━━━━━━━━━━━━━`
+            `🤖 *AI新闻机器人命令*\n━━━━━━━━━━━━━━━━━━\n\n*!news* - 📰 AI总结所有新闻\n*!tech* - 🤖 AI科技新闻\n*!world* - 🌍 世界新闻\n*!car* - 🚗 汽车新闻\n*!property* - 🏠 房产新闻\n*!rank* - 🏆 AI模型排行榜\n*!raw* - 📋 原始新闻\n\n*!ask <问题>* - 🤔 问 AI\n*!translate <内容>* - 🌐 中英互译\n*!weather <城市>* - 🌤️ 查天气\n*!remind <时长> <内容>* - ⏰ 定时提醒 (如 10m)\n*!健身* - 🏋️ 今日健身计划 (周/A/B/C 查详情)\n*!汇率* - 💱 美元/新币兑马币 live 汇率 + 兑换建议\n\n*!mymemory* - 🧠 查看小W对你的了解\n*!forget* - 🗑️ 清除所有记忆\n*!nosession* - 🗑️ 清除当前多轮对话状态\n*!groups* - 📋 列出所有群组ID\n*!website <描述>* - 🌐 生成网站 (白名单)\n*!websites* - 📋 查看活跃网站\n*!delsite <slug>* - 🗑️ 删除网站 (白名单)\n*!broadcast <消息>* - 📢 广播到群组 (白名单)\n*!ar* - 🔐 管理自动回复名单 (管理员)\n*!help* - ❓ 帮助菜单\n\n💡 发送任何消息，小W会智能回复（并记住你的偏好）\n━━━━━━━━━━━━━━━━━━`
           );
           return;
         }
@@ -492,14 +538,18 @@ async function processSmartReply(message, body, userId) {
         }
       }
 
+      const chatId = message.from;
       // Cache by both conversation and sender: replies can contain user facts and chat history.
-      const cacheScope = `${message.from}:${userId}`;
-      const cached = getReply(body, cacheScope);
+      const cacheScope = `${chatId}:${userId}`;
+      // 换汇/汇率问题：汇率随时在变，绕过回复缓存，保证每次都是最新数字。
+      const isFxQ = fx.isFxQuestion(body);
+      const cached = isFxQ ? null : getReply(body, cacheScope);
       if (cached) {
         // Was an instant reply (ban risk) — pace it like a human typing.
         await humanPause(chat, startedAt, cached);
         await chat.clearState();
         await message.reply(cached);
+        history.appendAssistant(chatId, cached);
       } else {
         await chat.sendStateTyping();
 
@@ -509,13 +559,22 @@ async function processSmartReply(message, body, userId) {
         if (facts) context += `记录的偏好：\n${facts}`;
         if (topTopics.length) context += `\n常聊话题：${topTopics.join(', ')}`;
 
-        const aiReply = await smartReply(body, context);
+        // 换汇/汇率类问题 → 注入实时汇率上下文，让回复基于真实数字（聊天仍走 OpenRouter）。
+        if (isFxQ) {
+          const fxCtx = await fx.contextSummary();
+          if (fxCtx) context += `\n\n${fxCtx}`;
+        }
+
+        // 带上最近对话上下文（末尾即当前消息，含群里发言人 & bot 刚发的内容）。
+        const convo = history.getMessages(chatId);
+        const aiReply = await smartReply(body, context, convo);
         if (aiReply) {
-          setReply(body, aiReply, cacheScope);
+          if (!isFxQ) setReply(body, aiReply, cacheScope); // 汇率答复不缓存（数字会过期）
           // Pad to the human delay (AI gen time already counts toward it), typing shown.
           await humanPause(chat, startedAt, aiReply);
           await chat.clearState();
           await message.reply(aiReply);
+          history.appendAssistant(chatId, aiReply);
         } else {
           await chat.clearState();
         }
@@ -663,6 +722,7 @@ async function sendMorningNews() {
       console.log('🧠 AI总结新闻中...');
       const summary = await summarizeNews(rawNews);
       await client.sendMessage(chatId, summary || rawNews);
+      history.appendAssistant(chatId, `（我刚在群里发了今日AI新闻摘要）\n${summary || ''}`);
       console.log('✅ AI新闻摘要发送成功!');
 
       console.log('🏆 获取模型排行榜...');
@@ -679,6 +739,45 @@ async function sendMorningNews() {
     }
   }
   console.error('❌ 新闻发送最终失败');
+}
+
+// 每日健身提醒：把当天训练/休息计划发给自己（或 FITNESS_TARGET）。
+async function sendFitnessReminder() {
+  const target = config.fitness?.target
+    || (config.myNumber ? config.myNumber.replace(/[^0-9]/g, '') + '@c.us' : '');
+  if (!target) {
+    console.error('❌ 健身提醒无接收方：请设置 MY_NUMBER 或 FITNESS_TARGET');
+    return;
+  }
+  try {
+    const text = workout.todayMessage(config.scheduleTz);
+    await client.sendMessage(target, text);
+    history.appendAssistant(target, text);
+    console.log('✅ 健身提醒发送成功!');
+  } catch (err) {
+    console.error(`❌ 健身提醒发送失败: ${err.message}`);
+  }
+}
+
+// 每日汇率推送：live USD→MYR / SGD→MYR + 7天高低 + 兑换建议 + AI走势，默认发到群组。
+async function sendFxUpdate() {
+  const target = config.fx?.target
+    || config.groupId
+    || (config.myNumber ? config.myNumber.replace(/[^0-9]/g, '') + '@c.us' : '');
+  if (!target) {
+    console.error('❌ 汇率推送无接收方：请设置 GROUP_ID / MY_NUMBER 或 FX_TARGET');
+    return;
+  }
+  try {
+    console.log('💱 获取汇率中...');
+    const text = await fx.buildMessage({ withAI: config.fx?.ai !== false });
+    await client.sendMessage(target, text);
+    // 记入上下文，这样群友追问「现在换划算吗」时 bot 知道刚发过汇率。
+    history.appendAssistant(target, text);
+    console.log('✅ 汇率推送发送成功!');
+  } catch (err) {
+    console.error(`❌ 汇率推送发送失败: ${err.message}`);
+  }
 }
 
 client.initialize();
