@@ -13,6 +13,7 @@ const { getSession, setSession, clearSession, pruneExpired } = require('./sessio
 const { getLeaderboard } = require('./leaderboard');
 const { buildWebsite, listSites, deleteSite, MAX_SITES, PUBLIC_HOST } = require('./website-builder');
 const autoreply = require('./autoreply');
+const { createMessageDeduper } = require('./message-deduper');
 
 // Admin who approves auto-replying to new numbers. Set AUTOREPLY_ADMIN in .env
 // (full international number, e.g. 60XXXXXXXXX; a leading-0 local MY number is
@@ -44,6 +45,9 @@ const smartReplyBuffers = new Map();
 // Serializes replies per user so the multi-second humanPause can't overlap and race
 // on the shared chat typing state or interleave out-of-order replies.
 const replyInFlight = new Set();
+// whatsapp-web.js can redeliver the same event after reconnect/reinjection.
+// Deduplicate by the stable WhatsApp message ID before any command or reply runs.
+const isDuplicateMessage = createMessageDeduper();
 
 console.log('🤖 WhatsApp AI新闻机器人启动中...');
 console.log(`🧠 AI模型: ${process.env.OPENROUTER_MODEL || 'not set'}`);
@@ -53,8 +57,15 @@ client.on('qr', (qr) => {
   qrcode.generate(qr, { small: true });
 });
 
+let schedulesRegistered = false;
 client.on('ready', () => {
   console.log('✅ 机器人已连接!');
+
+  if (schedulesRegistered) {
+    console.log('ℹ️ 定时任务已注册，跳过重复 ready 初始化');
+    return;
+  }
+  schedulesRegistered = true;
 
   const min = String(config.scheduleMinute);
   const hr = String(config.scheduleHour);
@@ -82,6 +93,11 @@ client.on('disconnected', (reason) => {
     reinitInProgress = true;
     try {
       console.log('♻️ 5秒后重新初始化客户端...');
+      // Tear down the old Puppeteer page before initialize(). Reusing an injected
+      // page can accumulate whatsapp-web.js event listeners and duplicate messages.
+      try { await client.destroy(); } catch (destroyErr) {
+        console.warn('旧客户端清理失败，继续重新初始化:', destroyErr.message);
+      }
       await client.initialize();
     } catch (err) {
       console.error('重新初始化失败:', err.message);
@@ -137,6 +153,12 @@ async function sendCategoryNews(message, category) {
 }
 
 client.on('message', async (message) => {
+  const messageId = message.id?._serialized;
+  if (messageId && isDuplicateMessage(messageId)) {
+    console.warn(`⚠️ 忽略重复消息事件: ${messageId}`);
+    return;
+  }
+
   const body = message.body.trim();
   const cmd = body.toLowerCase();
 
