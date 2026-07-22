@@ -54,7 +54,7 @@ specs:
     3. 新建 CLI 脚本和每测试独立的临时数据库 helper。
     4. 测试首次迁移、重复迁移、损坏 migration 和关闭连接。
 
-- unstarted: Task 3 — 定义完整 schema、索引与基础 repositories
+- completed: Task 3 — 定义完整 schema、索引与基础 repositories
   - Description: 建立 chats、permissions、messages、attachments、issues、issue_events、reply_match_sessions、summary_runs、summary_run_parts 和序列表，并封装仓储接口。
   - Dependencies: Task 2
   - Acceptance Criteria:
