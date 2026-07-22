@@ -273,8 +273,9 @@ specs:
     4. 建立可选 off-host adapter 与 restore-check CLI。
     5. 测试边界日期、关联保留、损坏文件、上传失败和恢复。
 
-- unstarted: Task 18 — 统一测试、说明书与受控上线
+- awaiting_user: Task 18 — 统一测试、说明书与受控上线
   - Description: 将现有测试统一到 `node:test`，补齐端到端 fake-client 场景，编写中文说明书并在真实授权群受控验收。
+  - Plan Note: 非 live 实现、文档、离线验收与受控 preflight 已完成；继续上线前必须由用户在服务器本地提供并核对 `PM_AUTHORIZED_GROUP_JID`、`PM_ERIC_JID`、`PM_ADMIN_JIDS`，决定是否提供可选 `PM_BACKUP_OFFSITE_DIR`，并完成仍待处理的真实授权群与 PM2 restart/schedule/data-recovery acceptance（不得把真实 JID 或秘密提交到仓库）。
   - Dependencies: Tasks 1–17
   - Acceptance Criteria:
     - `npm test` 单一命令在无网络条件下稳定通过，并保留现有 dedupe、XSS 和 cache regression coverage。

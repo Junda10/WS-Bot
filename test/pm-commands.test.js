@@ -176,6 +176,23 @@ function lastText(context) {
   return context.adapter.textSends.at(-1).parts.join('\n');
 }
 
+test('role guides use exactly the PM command signatures exposed by built-in help', () => {
+  const signatures = (text) => [...new Set(text.split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith('!pm '))
+    .map((line) => line.split(' — ')[0]))].sort();
+  const helpSignatures = signatures(formatPmHelp());
+  const documented = [
+    'pm-member-guide.md',
+    'pm-eric-card.md',
+    'pm-admin-guide.md',
+  ].flatMap((filename) => signatures(fs.readFileSync(
+    path.join(__dirname, '..', 'docs', filename),
+    'utf8'
+  )));
+  assert.deepEqual([...new Set(documented)].sort(), helpSignatures);
+});
+
 test('pure PM help, key=value parser, detail formatter, and deterministic splitter are bounded', () => {
   assert.match(formatPmHelp(), /list open/u);
   assert.match(formatPmHelp(), /attachment TV1.+同义别名/u);

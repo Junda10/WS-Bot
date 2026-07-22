@@ -153,6 +153,11 @@ test('router handles help/missing/unknown, supports injectable handlers, and awa
   result = await router.route(message, normalized({ body: '!pm help' }));
   assert.equal(result.kind, 'help');
   assert.match(replies.pop(), /PM 命令帮助/);
+  result = await router.route(message, normalized({ body: '!pm help admin' }));
+  assert.equal(result.kind, 'help');
+  const adminHelp = replies.pop();
+  assert.match(adminHelp, /PM 命令帮助｜管理员/u);
+  assert.doesNotMatch(adminHelp, /PM 命令帮助｜群成员/u);
   result = await router.route(message, normalized({ body: '!pm 不存在' }));
   assert.equal(result.kind, 'unknown');
   assert.match(replies.pop(), /不存在/);

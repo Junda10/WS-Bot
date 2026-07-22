@@ -116,7 +116,7 @@ class CommandRouter {
         return Object.freeze({ handled: true, kind: 'handler', parsed, value });
       }
       if (parsed.command === 'help') {
-        await this._reply(message, PM_HELP);
+        await this._reply(message, formatPmHelp(parsed.args[0]));
         return Object.freeze({ handled: true, kind: 'help', parsed });
       }
       await this._reply(
