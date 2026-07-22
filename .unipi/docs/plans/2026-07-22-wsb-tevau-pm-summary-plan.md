@@ -84,7 +84,7 @@ specs:
     3. 实现首条回复响应时间、多回复事件和纠错移动。
     4. 测试角色、JID alias、并发编号和非法状态转换。
 
-- unstarted: Task 5 — 建立 WhatsApp Adapter 与持久消息入口
+- completed: Task 5 — 建立 WhatsApp Adapter 与持久消息入口
   - Description: 规范化 WhatsApp message/chat/sender/quote/media 数据，先持久化再路由，并用数据库幂等取代只依赖 10 分钟内存去重。
   - Dependencies: Tasks 3, 4
   - Acceptance Criteria:

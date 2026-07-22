@@ -6,6 +6,10 @@ const axios = require('axios');
 const config = require('./config');
 const { getDatabase, closeDatabase } = require('./db/connection');
 const { migrateDatabase } = require('./db/migrate');
+const { createRepositories } = require('./db/repositories');
+const { PermissionService } = require('./services/permission-service');
+const { WhatsAppAdapter } = require('./whatsapp/adapter');
+const { AuthorizedGroupIngress, createMessageEventHandler } = require('./whatsapp/ingress');
 
 try {
   config.assertValid();
@@ -15,12 +19,29 @@ try {
 }
 
 let database;
+let repositories;
+let permissionService;
 try {
   database = getDatabase({
     filename: config.database.path,
     busyTimeoutMs: config.database.busyTimeoutMs,
   });
   const migrationResult = migrateDatabase(database);
+  repositories = createRepositories(database);
+  let authorizedChat = repositories.chats.findByJid(config.pm.authorizedGroupJid, {
+    includeDeleted: true,
+  });
+  if (!authorizedChat) {
+    authorizedChat = repositories.chats.create({
+      jid: config.pm.authorizedGroupJid,
+      timezone: config.reports.timezone,
+      now: Date.now(),
+    }).record;
+  }
+  permissionService = new PermissionService({
+    repositories,
+    authorizedChatJid: config.pm.authorizedGroupJid,
+  });
   console.log(`🗄️ SQLite ready (schema version ${migrationResult.currentVersion})`);
 } catch (error) {
   closeDatabase(database);
@@ -61,6 +82,7 @@ const client = new Client({
     args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
   },
 });
+const whatsappAdapter = new WhatsAppAdapter({ client });
 
 const autoReplyTracker = new Map();
 const COOLDOWN_MS = 12 * 60 * 60 * 1000;
@@ -179,7 +201,7 @@ async function notifyAdminNewNumber(number, name, preview) {
     `🚫 关闭: !ar off ${number}\n` +
     `📋 查看名单: !ar list`;
   try {
-    await client.sendMessage(ADMIN_ID, text);
+    await whatsappAdapter.sendText(ADMIN_ID, text);
   } catch (err) {
     console.error('notifyAdminNewNumber failed:', err.message);
   }
@@ -195,13 +217,7 @@ async function sendCategoryNews(message, category) {
   await message.reply(summary || raw);
 }
 
-client.on('message', async (message) => {
-  const messageId = message.id?._serialized;
-  if (messageId && isDuplicateMessage(messageId)) {
-    console.warn(`⚠️ 忽略重复消息事件: ${messageId}`);
-    return;
-  }
-
+async function routeExistingMessage(message) {
   const body = message.body.trim();
   const cmd = body.toLowerCase();
 
@@ -343,7 +359,7 @@ client.on('message', async (message) => {
         if (!groups.length) { await message.reply('没有配置广播群组（设置 BROADCAST_GROUPS 或 GROUP_ID）'); return; }
         let ok = 0;
         for (const g of groups) {
-          try { await client.sendMessage(g, text); ok++; } catch (e) { console.error('broadcast fail', g, e.message); }
+          try { await whatsappAdapter.sendText(g, text); ok++; } catch (e) { console.error('broadcast fail', g, e.message); }
         }
         await message.reply(`📢 已广播到 ${ok}/${groups.length} 个群组`);
         return;
@@ -510,6 +526,28 @@ client.on('message', async (message) => {
       console.log(`[DEBOUNCE user=${userId} buffered=${entry.messages.length} waiting=${debounceMs}ms]`);
     }
   }
+}
+
+const authorizedGroupIngress = new AuthorizedGroupIngress({
+  repositories,
+  permissionService,
+  route: routeExistingMessage,
+  isDuplicate: isDuplicateMessage,
+});
+const handleIncomingMessage = createMessageEventHandler({
+  ingress: authorizedGroupIngress,
+  adapter: whatsappAdapter,
+  routeLegacy: routeExistingMessage,
+  isDuplicate: isDuplicateMessage,
+});
+client.on('message', (message) => {
+  handleIncomingMessage(message).catch((error) => {
+    if (error.code === 'CHAT_NOT_AUTHORIZED' || error.code === 'CHAT_DISABLED') {
+      console.warn(`⚠️ 忽略未授权或已停用的群聊消息 (${error.code})`);
+      return;
+    }
+    console.error(`WhatsApp message ingress failed: ${error.message}`);
+  });
 });
 
 // Anti-ban human pause: pace the reply like a human typing. The target delay scales
@@ -745,13 +783,13 @@ async function sendMorningNews() {
       const rawNews = await getAllNews();
       console.log('🧠 AI总结新闻中...');
       const summary = await summarizeNews(rawNews);
-      await client.sendMessage(chatId, summary || rawNews);
+      await whatsappAdapter.sendText(chatId, summary || rawNews);
       history.appendAssistant(chatId, `（我刚在群里发了今日AI新闻摘要）\n${summary || ''}`);
       console.log('✅ AI新闻摘要发送成功!');
 
       console.log('🏆 获取模型排行榜...');
       const board = await getLeaderboard();
-      await client.sendMessage(chatId, board);
+      await whatsappAdapter.sendText(chatId, board);
       console.log('✅ 模型排行榜发送成功!');
       return;
     } catch (err) {
@@ -775,7 +813,7 @@ async function sendFitnessReminder() {
   }
   try {
     const text = workout.todayMessage(config.scheduleTz);
-    await client.sendMessage(target, text);
+    await whatsappAdapter.sendText(target, text);
     history.appendAssistant(target, text);
     console.log('✅ 健身提醒发送成功!');
   } catch (err) {
@@ -795,7 +833,7 @@ async function sendFxUpdate() {
   try {
     console.log('💱 获取汇率中...');
     const text = await fx.buildMessage({ withAI: config.fx?.ai !== false });
-    await client.sendMessage(target, text);
+    await whatsappAdapter.sendText(target, text);
     // 记入上下文，这样群友追问「现在换划算吗」时 bot 知道刚发过汇率。
     history.appendAssistant(target, text);
     console.log('✅ 汇率推送发送成功!');
