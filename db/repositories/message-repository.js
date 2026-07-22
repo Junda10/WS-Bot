@@ -122,6 +122,45 @@ class MessageRepository {
     ) || null;
   }
 
+  listRecent(chatId, options = {}) {
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    const limit = requireInteger(options.limit ?? 200, 'limit', { min: 1, max: 1000 });
+    const after = requireTimestamp(options.after ?? 0, 'after');
+    const includeCommands = options.includeCommands !== false;
+    const includeTombstones = options.includeTombstones === true;
+    return this.db.prepare(`
+      SELECT * FROM (
+        SELECT * FROM messages
+        WHERE chat_id = ? AND sent_at >= ?
+          ${includeCommands ? '' : 'AND is_command = 0'}
+          ${includeTombstones ? '' : 'AND is_tombstone = 0'}
+        ORDER BY sent_at DESC, id DESC
+        LIMIT ?
+      ) ORDER BY sent_at, id
+    `).all(id, after, limit);
+  }
+
+  createProcessed(input, options = {}) {
+    const completedAt = requireTimestamp(
+      options.completedAt ?? input.receivedAt,
+      'completedAt'
+    );
+    const transaction = this.db.transaction(() => {
+      const created = this.create(input);
+      if (!created.created) return created;
+      const claimed = this.claimProcessing(created.record.id, {
+        claimId: options.claimId || `completed:${created.record.message_uid}`,
+        now: completedAt,
+        leaseMs: 1,
+      });
+      if (!claimed) throw new Error('Could not claim newly created processed message');
+      const record = this.markProcessed(created.record.id, claimed.processing_claim_id, completedAt);
+      if (!record) throw new Error('Could not complete newly created processed message');
+      return { record, created: true };
+    });
+    return transaction();
+  }
+
   claimProcessing(id, options = {}) {
     const messageId = requireInteger(id, 'id', { min: 1 });
     const now = requireTimestamp(options.now, 'now');

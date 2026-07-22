@@ -1,0 +1,142 @@
+'use strict';
+
+const { parseNamespacedCommand } = require('./parser');
+
+const PM_HELP = `🧭 *PM 命令帮助*
+!pm help — 查看帮助
+!pm list open — 查看未闭环工单
+!pm show TV1 — 查看工单
+!pm find <关键词> — 搜索工单
+!pm add — 引用消息建立工单
+!pm update TV1 field="内容" — 更新工单
+!pm resolve TV1 note="说明" — 标记解决
+
+Eric：!pm reply / !pm confirm-reply TV1 / !pm cancel
+管理员：!pm archive / delete / restore / move-reply
+
+参数含空格时可使用单引号或双引号；反斜线可转义字符。`;
+
+const SUMMARY_HELP = `🧾 *群聊摘要命令帮助*
+!summary — 总结默认时间窗
+!summary 4h — 总结最近 4 小时
+!summary today — 总结今天
+!summary yesterday — 总结昨天
+!summary since "2026-07-20 09:00" — 从指定时间总结`;
+
+function requireHandler(handler, name) {
+  if (typeof handler !== 'function') throw new TypeError(`${name} handler must be a function`);
+  return handler;
+}
+
+class CommandRouter {
+  constructor(options = {}) {
+    if (!options.permissionService
+        || typeof options.permissionService.assertAuthorizedChat !== 'function') {
+      throw new TypeError('CommandRouter requires PermissionService');
+    }
+    this.permissionService = options.permissionService;
+    this.parse = options.parse || parseNamespacedCommand;
+    this.parserOptions = options.parserOptions || {};
+    this.pmHandlers = new Map();
+    this.summaryHandler = null;
+
+    for (const [command, handler] of Object.entries(options.pmHandlers || {})) {
+      this.registerPm(command, handler);
+    }
+    if (options.summaryHandler) this.setSummaryHandler(options.summaryHandler);
+  }
+
+  registerPm(command, handler) {
+    const key = String(command || '').trim().toLowerCase();
+    if (!key || /\s/u.test(key)) throw new TypeError('PM handler command must be one token');
+    if (key === 'help') throw new TypeError('The PM help command is reserved');
+    this.pmHandlers.set(key, requireHandler(handler, `PM ${key}`));
+    return this;
+  }
+
+  setSummaryHandler(handler) {
+    this.summaryHandler = requireHandler(handler, 'Summary');
+    return this;
+  }
+
+  async _reply(message, text) {
+    if (!message || typeof message.reply !== 'function') {
+      throw new TypeError('Command route requires a message with reply()');
+    }
+    await message.reply(text);
+  }
+
+  async route(message, normalized, persisted = null) {
+    const body = normalized?.body ?? message?.body;
+    const parsed = this.parse(body, this.parserOptions);
+    if (!parsed.matched) return Object.freeze({ handled: false, parsed });
+
+    // Parsing is side-effect free. The configured, enabled chat boundary must
+    // pass before any reply or injected business handler can run.
+    const chat = this.permissionService.assertAuthorizedChat(normalized?.chatJid);
+
+    if (!parsed.ok) {
+      await this._reply(message, `⚠️ 命令格式错误：${parsed.error.message}\n发送 !${parsed.namespace} help 查看用法。`);
+      return Object.freeze({ handled: true, kind: 'parse-error', parsed });
+    }
+
+    const context = Object.freeze({
+      message,
+      normalized,
+      persisted,
+      parsed,
+      chat,
+      reply: (text) => this._reply(message, text),
+    });
+
+    if (parsed.namespace === 'pm') {
+      if (!parsed.command) {
+        await this._reply(message, `⚠️ 缺少 PM 子命令。\n\n${PM_HELP}`);
+        return Object.freeze({ handled: true, kind: 'missing', parsed });
+      }
+      if (parsed.command === 'help') {
+        await this._reply(message, PM_HELP);
+        return Object.freeze({ handled: true, kind: 'help', parsed });
+      }
+      const handler = this.pmHandlers.get(parsed.command);
+      if (handler) {
+        const value = await handler(context);
+        return Object.freeze({ handled: true, kind: 'handler', parsed, value });
+      }
+      await this._reply(
+        message,
+        `❓ 未知或尚未启用的 PM 命令：${parsed.command}\n发送 !pm help 查看可用命令。`
+      );
+      return Object.freeze({ handled: true, kind: 'unknown', parsed });
+    }
+
+    if (parsed.tokens.length === 1 && parsed.tokens[0].toLowerCase() === 'help') {
+      await this._reply(message, SUMMARY_HELP);
+      return Object.freeze({ handled: true, kind: 'help', parsed });
+    }
+    if (this.summaryHandler) {
+      const value = await this.summaryHandler(context);
+      return Object.freeze({ handled: true, kind: 'handler', parsed, value });
+    }
+    if (parsed.tokens.length === 0) {
+      await this._reply(message, SUMMARY_HELP);
+      return Object.freeze({ handled: true, kind: 'missing-handler', parsed });
+    }
+    await this._reply(
+      message,
+      `❓ 未知或尚未启用的摘要参数：${parsed.tokens[0]}\n发送 !summary help 查看用法。`
+    );
+    return Object.freeze({ handled: true, kind: 'unknown', parsed });
+  }
+}
+
+function createCommandRouter(options) {
+  return new CommandRouter(options);
+}
+
+module.exports = {
+  CommandRouter,
+  PM_HELP,
+  SUMMARY_HELP,
+  createCommandRouter,
+};

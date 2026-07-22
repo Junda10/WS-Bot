@@ -10,6 +10,7 @@ const { createRepositories } = require('./db/repositories');
 const { PermissionService } = require('./services/permission-service');
 const { WhatsAppAdapter } = require('./whatsapp/adapter');
 const { AuthorizedGroupIngress, createMessageEventHandler } = require('./whatsapp/ingress');
+const { createCommandRouter } = require('./commands/router');
 
 try {
   config.assertValid();
@@ -62,6 +63,12 @@ const workout = require('./workout');
 const fx = require('./fx');
 const history = require('./history');
 const { createMessageDeduper } = require('./message-deduper');
+
+history.configure({
+  repositories,
+  authorizedGroupJid: config.pm.authorizedGroupJid,
+});
+const namespacedCommandRouter = createCommandRouter({ permissionService });
 
 // Admin who approves auto-replying to new numbers. Set AUTOREPLY_ADMIN in .env
 // (full international number, e.g. 60XXXXXXXXX; a leading-0 local MY number is
@@ -217,12 +224,14 @@ async function sendCategoryNews(message, category) {
   await message.reply(summary || raw);
 }
 
-async function routeExistingMessage(message) {
+async function routeExistingMessage(message, normalized = null) {
   const body = message.body.trim();
   const cmd = body.toLowerCase();
 
-  // 记录进对话上下文（命令、空消息、bot 自己发的不记）。用轻量的 notifyName，避免每条都 getContact。
-  if (!message.fromMe && body && !body.startsWith('!')) {
+  // 授权群消息已由 durable ingress 写入 SQLite；其他群和私聊继续使用原内存 history。
+  // 命令、空消息、bot 自己发的不记。用轻量 notifyName，避免每条都 getContact。
+  const alreadyPersistedForHistory = normalized?.chatJid === config.pm.authorizedGroupJid;
+  if (!alreadyPersistedForHistory && !message.fromMe && body && !body.startsWith('!')) {
     const name = message._data?.notifyName || (message.author || '').split('@')[0] || '';
     history.appendUser(message.from, name, body);
   }
@@ -528,10 +537,16 @@ async function routeExistingMessage(message) {
   }
 }
 
+async function routeAuthorizedMessage(message, normalized, persisted) {
+  const commandResult = await namespacedCommandRouter.route(message, normalized, persisted);
+  if (commandResult.handled) return commandResult;
+  return routeExistingMessage(message, normalized, persisted);
+}
+
 const authorizedGroupIngress = new AuthorizedGroupIngress({
   repositories,
   permissionService,
-  route: routeExistingMessage,
+  route: routeAuthorizedMessage,
   isDuplicate: isDuplicateMessage,
 });
 const handleIncomingMessage = createMessageEventHandler({

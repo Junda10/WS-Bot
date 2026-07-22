@@ -98,7 +98,7 @@ specs:
     3. 保留 `message-deduper.js` 作为快速过滤，SQLite 唯一键作为最终依据。
     4. 用 fake client 测试引用、媒体、重复事件和发送接口。
 
-- unstarted: Task 6 — 兼容现有 history 并集中命令路由
+- completed: Task 6 — 兼容现有 history 并集中命令路由
   - Description: 让现有 AI 上下文可从持久消息仓储读取，并建立 `!pm`/`!summary` router，同时不一次性重写旧命令。
   - Dependencies: Task 5
   - Acceptance Criteria:
