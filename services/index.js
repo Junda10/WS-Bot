@@ -1,5 +1,7 @@
 'use strict';
 
+const { CandidateShortlistService, MAX_AI_CANDIDATES } = require('./candidate-shortlist-service');
+const { PmAiService } = require('./pm-ai-service');
 const {
   ACTIONS,
   AuthorizationError,
@@ -15,6 +17,9 @@ const {
 
 module.exports = {
   ACTIONS,
+  CandidateShortlistService,
+  MAX_AI_CANDIDATES,
+  PmAiService,
   AuthorizationError,
   IssueDomainError,
   IssueService,

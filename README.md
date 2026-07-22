@@ -121,6 +121,17 @@ npm run ocr:smoke -- --expect "known substring" ./sample-eng-chi.png
 # or set PM_OCR_SMOKE_EXPECT
 ```
 
+#### Structured PM AI smoke (optional, billable)
+
+The normal test suite never calls OpenRouter. The real smoke makes at most three tiny calls through one low-cost model, prints only redacted contract metadata, and requires both opt-ins:
+
+```bash
+OPENROUTER_PM_SMOKE=1 npm run pm-ai:smoke -- --run
+# optional model override: OPENROUTER_PM_SMOKE_MODEL=z-ai/glm-4.7-flash
+```
+
+It never prints the API key or raw evidence/model output and is not part of `npm test`.
+
 ### Clarification (ask-user threshold) module
 
 When `CLARIFY_ENABLED=true` and the sender is in `CLARIFY_WHITELIST`, ambiguous user questions

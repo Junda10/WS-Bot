@@ -8,6 +8,7 @@
     "db:migrate": "node scripts/db-migrate.js",
     "db:check": "node scripts/db-check.js",
     "ocr:smoke": "node scripts/ocr-smoke.js",
+    "pm-ai:smoke": "node scripts/openrouter-pm-smoke.js",
     "test": "node --test test/*.js",
     "test:config": "node --test test/config.test.js",
     "test:db": "node --test test/database.test.js"

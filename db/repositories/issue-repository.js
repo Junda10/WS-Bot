@@ -226,6 +226,52 @@ class IssueRepository {
     `).all(requireInteger(chatId, 'chatId', { min: 1 }));
   }
 
+  // Bounded read models for deterministic AI shortlisting. These deliberately
+  // avoid listOpen(), which may grow without bound, and never return records to
+  // the model directly; CandidateShortlistService compacts the selected rows.
+  searchOpenCandidates(terms, { chatId, limit = 40 } = {}) {
+    if (!Array.isArray(terms) || terms.length === 0 || terms.length > 16) {
+      throw new TypeError('terms must contain 1..16 search terms');
+    }
+    const normalized = [...new Set(terms.map((term, index) => {
+      const text = requireString(term, `terms[${index}]`, { max: 100 }).trim();
+      if (Array.from(text).length < 3) throw new TypeError('FTS candidate terms must have 3+ characters');
+      return text;
+    }))];
+    const maximum = requireInteger(limit, 'limit', { min: 1 });
+    if (maximum > 100) throw new RangeError('limit must not exceed 100');
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    const fts = normalized.map((term) => `"${term.replaceAll('"', '""')}"`).join(' OR ');
+    return this.db.prepare(`
+      WITH matches AS (
+        SELECT rowid, bm25(issue_fts) AS rank
+        FROM issue_fts
+        WHERE issue_fts MATCH @fts
+      )
+      SELECT i.*, matches.rank AS rank
+      FROM matches
+      JOIN issues i ON i.id = matches.rowid
+      WHERE i.chat_id = @chatId AND i.deleted_at IS NULL
+        AND i.status IN ('WAITING_TEVAU', 'REPLIED')
+      ORDER BY matches.rank, i.updated_at DESC, i.id
+      LIMIT @limit
+    `).all({ fts, chatId: id, limit: maximum });
+  }
+
+  listRecentOpenCandidates(chatId, { limit = 40 } = {}) {
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    const maximum = requireInteger(limit, 'limit', { min: 1 });
+    if (maximum > 100) throw new RangeError('limit must not exceed 100');
+    return this.db.prepare(`
+      SELECT i.*, NULL AS rank
+      FROM issues i
+      WHERE i.chat_id = ? AND i.deleted_at IS NULL
+        AND i.status IN ('WAITING_TEVAU', 'REPLIED')
+      ORDER BY i.updated_at DESC, i.id DESC
+      LIMIT ?
+    `).all(id, maximum);
+  }
+
   findBySourceWhatsappMessageId(sourceWhatsappMessageId, chatId, {
     includeDeleted = false,
   } = {}) {

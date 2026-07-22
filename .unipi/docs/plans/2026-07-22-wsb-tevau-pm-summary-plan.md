@@ -170,7 +170,7 @@ specs:
     3. 接入 attachment extraction 接口及 parse status。
     4. 添加小型中英文图片/扫描 PDF smoke test；默认测试 mock 大型 OCR。
 
-- unstarted: Task 11 — 扩展 AI 结构化接口与安全合约
+- completed: Task 11 — 扩展 AI 结构化接口与安全合约
   - Description: 在 `ai.js` 增加问题提取、回复匹配和分块摘要 API，返回可验证结果，而不是让业务逻辑解析任意自由文本。
   - Dependencies: Tasks 1, 9, 10
   - Acceptance Criteria:
