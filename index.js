@@ -8,6 +8,7 @@ const { getDatabase, closeDatabase } = require('./db/connection');
 const { migrateDatabase } = require('./db/migrate');
 const { createRepositories } = require('./db/repositories');
 const { PermissionService } = require('./services/permission-service');
+const { createDebouncedSmartReplyScheduler } = require('./services/debounced-smart-reply');
 const { WhatsAppAdapter } = require('./whatsapp/adapter');
 const { AuthorizedGroupIngress, createMessageEventHandler } = require('./whatsapp/ingress');
 const { createCommandRouter } = require('./commands/router');
@@ -94,13 +95,12 @@ const whatsappAdapter = new WhatsAppAdapter({ client });
 const autoReplyTracker = new Map();
 const COOLDOWN_MS = 12 * 60 * 60 * 1000;
 
-// Per-user smart-reply debounce buffer.
-// Map<userId, { messages: string[], lastMessage, timer }>
-const smartReplyBuffers = new Map();
-// Users whose reply is currently being generated/sent (incl. the human-typing pause).
-// Serializes replies per user so the multi-second humanPause can't overlap and race
-// on the shared chat typing state or interleave out-of-order replies.
-const replyInFlight = new Set();
+// Keep each deferred smart reply attached to the inbound route promise. The durable
+// ingress remains PROCESSING until generation, send, and history persistence finish.
+const smartReplyScheduler = createDebouncedSmartReplyScheduler({
+  debounceMs: config.smartReply?.debounceMs ?? 3000,
+  process: ({ message, body, userId }) => processSmartReply(message, body, userId),
+});
 // whatsapp-web.js can redeliver the same event after reconnect/reinjection.
 // Deduplicate by the stable WhatsApp message ID before any command or reply runs.
 const isDuplicateMessage = createMessageDeduper();
@@ -224,7 +224,7 @@ async function sendCategoryNews(message, category) {
   await message.reply(summary || raw);
 }
 
-async function routeExistingMessage(message, normalized = null) {
+async function routeExistingMessage(message, normalized = null, persisted = null) {
   const body = message.body.trim();
   const cmd = body.toLowerCase();
 
@@ -468,6 +468,7 @@ async function routeExistingMessage(message, normalized = null) {
       }
     } catch (err) {
       console.error('Command error:', err.message);
+      if (persisted) throw err;
     }
     return;
   }
@@ -510,30 +511,14 @@ async function routeExistingMessage(message, normalized = null) {
 
     if (body.length <= 1) return;
 
-    const debounceMs = config.smartReply?.debounceMs ?? 3000;
-    const entry = smartReplyBuffers.get(userId) || { messages: [], lastMessage: null, timer: null };
-    entry.messages.push(body);
-    entry.lastMessage = message;
-    if (entry.timer) clearTimeout(entry.timer);
-    const fire = () => {
-      // A reply for this user is still being sent (humanPause in progress) — wait and
-      // retry instead of launching a concurrent flow that would race the typing state.
-      if (replyInFlight.has(userId)) {
-        entry.timer = setTimeout(fire, 1500);
-        return;
-      }
-      smartReplyBuffers.delete(userId);
-      const merged = entry.messages.join('\n');
-      replyInFlight.add(userId);
-      processSmartReply(entry.lastMessage, merged, userId)
-        .catch(err => console.error('Smart-reply (debounced) error:', err.message))
-        .finally(() => replyInFlight.delete(userId));
-    };
-    entry.timer = setTimeout(fire, debounceMs);
-    smartReplyBuffers.set(userId, entry);
-    if (entry.messages.length > 1) {
-      console.log(`[DEBOUNCE user=${userId} buffered=${entry.messages.length} waiting=${debounceMs}ms]`);
-    }
+    return smartReplyScheduler.schedule({
+      id: normalized?.id || message.id?._serialized || `${message.from}:${message.timestamp}:${body}`,
+      key: `${message.from}\u0000${userId}`,
+      message,
+      body,
+      userId,
+      persisted,
+    });
   }
 }
 
@@ -665,6 +650,7 @@ async function processSmartReply(message, body, userId) {
       }).catch(() => {});
     } catch (err) {
       console.error('Smart-reply error:', err.message);
+      throw err;
     }
 }
 
@@ -872,11 +858,24 @@ async function shutdown(signal) {
   // Stop admission first, then let accepted handlers finish their durable
   // PROCESSED/FAILED transition before either transport or database disappears.
   handleIncomingMessage.stopAccepting();
+  smartReplyScheduler.stopAccepting();
+  const cancelled = smartReplyScheduler.cancelPending();
+  if (cancelled > 0) {
+    console.log(`🛑 Cancelled ${cancelled} queued smart repl${cancelled === 1 ? 'y' : 'ies'}`);
+  }
   client.off?.('message', onClientMessage);
   try {
     const drain = await handleIncomingMessage.drain({ timeoutMs: 10_000 });
     if (drain.timedOut) {
-      console.warn(`WhatsApp ingress drain timed out with ${drain.remaining} handler(s) still active`);
+      // Do not hang process shutdown forever on an unavailable AI/transport call.
+      // Its durable PROCESSING lease remains retryable after expiry.
+      console.warn(`WhatsApp ingress drain timed out with ${drain.remaining} handler(s) still active; forcing bounded shutdown`);
+    }
+    const smartReplyDrain = await smartReplyScheduler.drain({
+      timeoutMs: drain.timedOut ? 0 : 10_000,
+    });
+    if (smartReplyDrain.timedOut) {
+      console.warn(`Smart-reply drain timed out with ${smartReplyDrain.remaining} operation(s) still active`);
     }
   } catch (error) {
     console.warn(`WhatsApp ingress drain failed: ${error.message}`);

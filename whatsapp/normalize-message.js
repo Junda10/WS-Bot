@@ -53,6 +53,12 @@ function finiteMetadataInteger(value) {
   return Number.isFinite(numeric) && numeric >= 0 ? Math.trunc(numeric) : null;
 }
 
+function senderDisplayName(value) {
+  if (value === null || value === undefined) return null;
+  const normalized = String(value).replace(/[\p{Cc}\p{Cf}]/gu, ' ').trim();
+  return normalized ? normalized.slice(0, 200) : null;
+}
+
 function mediaMetadata(source) {
   if (!source) return null;
   const data = source._data || source;
@@ -151,11 +157,15 @@ function normalizeMessage(message, options = {}) {
   const receivedAt = Math.max(sentAt, utcTimestampMs(receivedClock, 'received timestamp'));
   const body = String(message.body ?? message._data?.caption ?? message._data?.body ?? '');
   const media = mediaMetadata(message);
+  const displayName = senderDisplayName(
+    message.notifyName ?? message._data?.notifyName ?? message._data?.sender?.notifyName
+  );
 
   return Object.freeze({
     id,
     chatJid,
     senderJid,
+    senderDisplayName: displayName,
     isGroup,
     fromMe: Boolean(message.fromMe),
     body,
@@ -174,6 +184,7 @@ module.exports = {
   normalizeChatJid,
   normalizeMessage,
   normalizeUserJid,
+  senderDisplayName,
   serializedId,
   utcTimestampMs,
 };

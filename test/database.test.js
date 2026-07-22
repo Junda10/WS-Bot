@@ -108,6 +108,52 @@ test('project migration 003 upgrades routed rows and adds durable ingress state 
   assert.deepEqual(db.pragma('foreign_key_check'), []);
 });
 
+test('project migration 004 preserves existing messages and adds bounded display names', (t) => {
+  const fixture = makeFixture(t);
+  const projectMigrations = path.join(__dirname, '..', 'db', 'migrations');
+  for (const name of [
+    '001_database_baseline.sql',
+    '002_pm_domain_schema.sql',
+    '003_durable_message_ingress.sql',
+  ]) {
+    fs.copyFileSync(path.join(projectMigrations, name), path.join(fixture.migrationsDir, name));
+  }
+  const db = openFixture(t, fixture);
+  migrateDatabase(db, { migrationsDir: fixture.migrationsDir, now: () => 1 });
+  db.exec(`
+    INSERT INTO chats (chat_uid, jid, timezone, created_at, updated_at)
+    VALUES ('display-upgrade-chat', '120300000000000000@g.us', 'UTC', 10, 10);
+    INSERT INTO messages (
+      message_uid, whatsapp_message_id, chat_id, sender_jid, body,
+      sent_at, received_at, created_at
+    ) VALUES ('pre-004', 'pre-004', 1, '601@c.us', 'existing', 20, 20, 20);
+  `);
+
+  fs.copyFileSync(
+    path.join(projectMigrations, '004_message_sender_display_name.sql'),
+    path.join(fixture.migrationsDir, '004_message_sender_display_name.sql')
+  );
+  assert.deepEqual(migrateDatabase(db, {
+    migrationsDir: fixture.migrationsDir, now: () => 2,
+  }), { applied: [4], currentVersion: 4 });
+  assert.equal(db.prepare(
+    "SELECT sender_display_name FROM messages WHERE whatsapp_message_id='pre-004'"
+  ).get().sender_display_name, null);
+  db.prepare(`
+    INSERT INTO messages (
+      message_uid, whatsapp_message_id, chat_id, sender_jid, sender_display_name,
+      body, sent_at, received_at, created_at
+    ) VALUES ('post-004', 'post-004', 1, '602@c.us', '小明', 'new', 30, 30, 30)
+  `).run();
+  assert.equal(db.prepare(
+    "SELECT sender_display_name FROM messages WHERE whatsapp_message_id='post-004'"
+  ).get().sender_display_name, '小明');
+  assert.throws(() => db.prepare(
+    "UPDATE messages SET sender_display_name='' WHERE whatsapp_message_id='post-004'"
+  ).run(), /CHECK constraint failed/);
+  assert.deepEqual(db.pragma('foreign_key_check'), []);
+});
+
 test('production PRAGMAs and private POSIX permissions are effective on disk', (t) => {
   const fixture = makeFixture(t);
   const db = openFixture(t, fixture);

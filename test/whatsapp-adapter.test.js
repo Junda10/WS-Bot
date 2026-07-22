@@ -10,6 +10,7 @@ const { closeDatabase, getDatabase } = require('../db/connection');
 const { migrateDatabase } = require('../db/migrate');
 const { createRepositories } = require('../db/repositories');
 const { createMessageDeduper } = require('../message-deduper');
+const { createDebouncedSmartReplyScheduler } = require('../services/debounced-smart-reply');
 const { PermissionService } = require('../services/permission-service');
 const { WhatsAppAdapter } = require('../whatsapp/adapter');
 const { AuthorizedGroupIngress, createMessageEventHandler } = require('../whatsapp/ingress');
@@ -102,6 +103,7 @@ test('normalizer handles direct/group JIDs, serialized IDs, UTC timestamps, quot
     downloadMedia: async () => { downloads += 1; },
     getQuotedMessage: async () => { quoteFetches += 1; },
     _data: {
+      notifyName: '  小明\u0000 ',
       mimetype: 'application/pdf', filename: 'evidence.pdf', size: 12345,
       pageCount: 3, quotedMsg: quotedData,
     },
@@ -109,6 +111,7 @@ test('normalizer handles direct/group JIDs, serialized IDs, UTC timestamps, quot
 
   assert.equal(group.chatJid, GROUP_JID);
   assert.equal(group.senderJid, LID_JID);
+  assert.equal(group.senderDisplayName, '小明');
   assert.equal(group.isCommand, true);
   assert.equal(group.type, 'MEDIA');
   assert.deepEqual(group.media, {
@@ -280,6 +283,7 @@ test('authorized ingress persists before routing and stores quote/media metadata
     timestamp: 1_720_000_050,
     downloadMedia: async () => { downloads += 1; },
     _data: {
+      notifyName: '文档成员',
       mimetype: 'text/markdown', filename: 'notes.md', filesize: 42,
       quotedMsg: {
         id: { _serialized: quoted.whatsapp_message_id }, from: GROUP_JID,
@@ -295,6 +299,7 @@ test('authorized ingress persists before routing and stores quote/media metadata
   const persisted = repositories.messages.findByWhatsappId('authorized-media-id');
   assert.equal(persisted.chat_id, chat.id);
   assert.equal(persisted.sender_jid, LID_JID);
+  assert.equal(persisted.sender_display_name, '文档成员');
   assert.equal(persisted.quoted_message_id, quoted.id);
   assert.equal(persisted.quoted_whatsapp_message_id, quoted.whatsapp_message_id);
   assert.equal(persisted.quoted_body, 'earlier');
@@ -538,6 +543,114 @@ test('dispatcher preserves direct and cross-group legacy behavior without PM sid
   assert.equal(client.sends[1].chatJid, OTHER_GROUP_JID);
   assert.equal(repositories.messages.findByWhatsappId('cross-chat-id'), null,
     'cross-group legacy commands must have no PM persistence side effect');
+});
+
+test('durable route awaits smart-reply debounce, AI, and send before marking PROCESSED', async (t) => {
+  const { repositories, permissionService } = fixture(t);
+  const client = new FakeClient();
+  const adapter = new WhatsAppAdapter({ client });
+  let announceStarted;
+  let releaseAi;
+  const started = new Promise((resolve) => { announceStarted = resolve; });
+  const aiGate = new Promise((resolve) => { releaseAi = resolve; });
+  const scheduler = createDebouncedSmartReplyScheduler({
+    debounceMs: 1,
+    process: async ({ message, body }) => {
+      announceStarted();
+      await aiGate;
+      await message.reply(`AI: ${body}`);
+    },
+  });
+  const route = (message, normalized, persisted) => scheduler.schedule({
+    id: normalized.id,
+    key: `${normalized.chatJid}\u0000${normalized.senderJid}`,
+    message,
+    body: normalized.body,
+    userId: normalized.senderJid,
+    persisted,
+  });
+  const ingress = new AuthorizedGroupIngress({ repositories, permissionService, route });
+  const handler = createMessageEventHandler({
+    ingress, adapter, routeLegacy: route, clock: () => 1_720_000_300_000,
+  });
+  const raw = rawMessage({
+    id: 'debounced-durable-route', from: GROUP_JID, author: USER_JID,
+    body: 'wait for AI', timestamp: 1_720_000_290,
+  });
+
+  let routeSettled = false;
+  const operation = handler(raw).then((result) => {
+    routeSettled = true;
+    return result;
+  });
+  await started;
+  assert.equal(routeSettled, false);
+  assert.equal(client.sends.length, 0);
+  assert.equal(
+    repositories.messages.findByWhatsappId(raw.id).processing_status,
+    'PROCESSING'
+  );
+
+  releaseAi();
+  const result = await operation;
+  assert.equal(result.record.processing_status, 'PROCESSED');
+  assert.equal(client.sends.length, 1);
+  assert.equal(client.sends[0].content, 'AI: wait for AI');
+  assert.deepEqual(await scheduler.drain(), {
+    drained: true, timedOut: false, remaining: 0,
+  });
+});
+
+test('smart-reply send failure rejects the route, records FAILED, and remains retryable', async (t) => {
+  const { repositories, permissionService } = fixture(t);
+  const client = new FakeClient();
+  const originalSend = client.sendMessage.bind(client);
+  let sendAttempts = 0;
+  client.sendMessage = async (...args) => {
+    sendAttempts += 1;
+    if (sendAttempts === 1) throw new Error('temporary send outage');
+    return originalSend(...args);
+  };
+  const adapter = new WhatsAppAdapter({ client });
+  const scheduler = createDebouncedSmartReplyScheduler({
+    debounceMs: 0,
+    process: async ({ message }) => message.reply('retryable AI reply'),
+  });
+  const route = (message, normalized, persisted) => scheduler.schedule({
+    id: normalized.id,
+    key: `${normalized.chatJid}\u0000${normalized.senderJid}`,
+    message,
+    body: normalized.body,
+    userId: normalized.senderJid,
+    persisted,
+  });
+  const deduper = createMessageDeduper();
+  const ingress = new AuthorizedGroupIngress({
+    repositories, permissionService, route, isDuplicate: deduper,
+    clock: () => 1_720_000_400_000,
+  });
+  const handler = createMessageEventHandler({
+    ingress, adapter, routeLegacy: route, isDuplicate: deduper,
+    clock: () => 1_720_000_400_000,
+  });
+  const raw = rawMessage({
+    id: 'debounced-send-retry', from: GROUP_JID, author: USER_JID,
+    body: 'please retry', timestamp: 1_720_000_390,
+  });
+
+  await assert.rejects(handler(raw), /temporary send outage/);
+  let persisted = repositories.messages.findByWhatsappId(raw.id);
+  assert.equal(persisted.processing_status, 'FAILED');
+  assert.equal(persisted.processing_attempt_count, 1);
+  assert.match(persisted.processing_last_error, /temporary send outage/);
+
+  const retried = await handler(raw);
+  persisted = repositories.messages.findByWhatsappId(raw.id);
+  assert.equal(retried.duplicate, false);
+  assert.equal(persisted.processing_status, 'PROCESSED');
+  assert.equal(persisted.processing_attempt_count, 2);
+  assert.equal(sendAttempts, 2);
+  assert.equal(client.sends.length, 1);
 });
 
 test('stop-accepting and bounded drain wait for an in-flight route before shutdown', async (t) => {

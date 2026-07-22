@@ -89,7 +89,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   `).all().map((row) => row.name);
   for (const table of expectedTables) assert.ok(tables.includes(table), `${table} should exist`);
   assert.ok(tables.includes('issue_fts'));
-  assert.equal(db.pragma('user_version', { simple: true }), 3);
+  assert.equal(db.pragma('user_version', { simple: true }), 4);
   assert.deepEqual(db.pragma('foreign_key_check'), []);
   assert.deepEqual(
     db.prepare("SELECT name, next_value, updated_at FROM sequences WHERE name='issue_tv'").get(),
@@ -211,6 +211,26 @@ test('disabled identities and aliases never authorize; aliases are chat-scoped',
   repositories.permissions.softDelete(first.id, 1120);
   assert.equal(repositories.permissions.resolve(chatOne.id, 'same@lid'), null);
   assert.equal(repositories.permissions.resolve(chatOne.id, '601@c.us'), null);
+});
+
+test('message repository persists sender display names and filters blank rows before recent LIMIT', (t) => {
+  const { db, repositories } = fixture(t);
+  const chat = seedChat(repositories);
+  seedMessage(repositories, chat.id, 'visible-old', 2000, {
+    senderDisplayName: '小明', body: 'older visible',
+  });
+  seedMessage(repositories, chat.id, 'visible-new', 2001, { body: 'newer visible' });
+  seedMessage(repositories, chat.id, 'blank-one', 2002, { body: '' });
+  seedMessage(repositories, chat.id, 'blank-two', 2003, { body: ' \t\r\n ' });
+  seedMessage(repositories, chat.id, 'blank-unicode', 2004, { body: '\u00a0\u3000' });
+
+  const rows = repositories.messages.listRecent(chat.id, { limit: 2 });
+  assert.deepEqual(rows.map((row) => row.body), ['older visible', 'newer visible']);
+  assert.equal(rows[0].sender_display_name, '小明');
+  assert.throws(() => seedMessage(repositories, chat.id, 'bad-display', 2004, {
+    senderDisplayName: ' ',
+  }), /senderDisplayName/);
+  assert.equal(db.pragma('integrity_check', { simple: true }), 'ok');
 });
 
 test('message repository is idempotent, derives immutable quote snapshots, and enforces same-chat quotes', (t) => {

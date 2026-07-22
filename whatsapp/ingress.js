@@ -46,6 +46,7 @@ class AuthorizedGroupIngress {
         whatsappMessageId: normalized.id,
         chatId: chat.id,
         senderJid: normalized.senderJid,
+        senderDisplayName: normalized.senderDisplayName,
         messageType: normalized.type,
         body: normalized.body,
         quotedMessageId,
@@ -252,18 +253,23 @@ function createMessageEventHandler(options = {}) {
   onMessage.isAccepting = () => accepting;
   onMessage.inFlightCount = () => inFlight.size;
   onMessage.drain = async ({ timeoutMs = DEFAULT_DRAIN_TIMEOUT_MS } = {}) => {
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
-      throw new TypeError('drain timeoutMs must be a non-negative safe integer');
+    if (timeoutMs !== null && (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0)) {
+      throw new TypeError('drain timeoutMs must be null or a non-negative safe integer');
     }
     const pending = [...inFlight];
     if (pending.length === 0) return { drained: true, timedOut: false, remaining: 0 };
+
+    const settled = Promise.allSettled(pending).then(() => 'settled');
+    if (timeoutMs === null) {
+      await settled;
+      return { drained: true, timedOut: false, remaining: inFlight.size };
+    }
 
     let timer;
     const timeout = new Promise((resolve) => {
       timer = setTimeout(() => resolve('timeout'), timeoutMs);
       timer.unref?.();
     });
-    const settled = Promise.allSettled(pending).then(() => 'settled');
     const result = await Promise.race([settled, timeout]);
     clearTimeout(timer);
     return {

@@ -16,13 +16,14 @@ const MAX_CHATS = positiveEnvInteger('CONTEXT_MAX_CHATS', 200);
 const DEFAULT_ASSISTANT_JID = 'wsb-history-assistant@c.us';
 
 const store = new Map(); // chatId -> { msgs: [{role, name, text, ts}], last }
-const persistentClearAfter = new Map();
+const persistentClearWatermark = new Map();
 let persistent = null;
 
 function configure(options = {}) {
   if (!options.repositories?.chats
       || !options.repositories?.messages
       || typeof options.repositories.messages.listRecent !== 'function'
+      || typeof options.repositories.messages.highWatermark !== 'function'
       || typeof options.repositories.messages.createProcessed !== 'function') {
     throw new TypeError('history.configure requires chat and message repositories');
   }
@@ -45,7 +46,7 @@ function configure(options = {}) {
 
 function resetConfiguration() {
   persistent = null;
-  persistentClearAfter.clear();
+  persistentClearWatermark.clear();
 }
 
 function _get(chatId) {
@@ -106,12 +107,42 @@ function _pushPersistent(chat, role, text, name) {
     senderJid: role === 'assistant'
       ? persistent.assistantJid
       : `history-user:${String(name || 'unknown').slice(0, 150)}`,
+    senderDisplayName: role === 'user' ? _cleanName(name) : null,
     messageType: role === 'assistant' ? 'SYSTEM' : 'TEXT',
     body: text.trim().slice(0, 1000),
     sentAt: now,
     receivedAt: now,
     isCommand: false,
   }, { completedAt: now });
+}
+
+function _cleanName(value) {
+  const cleaned = String(value || '')
+    .replace(/[\p{Cc}\p{Cf}]/gu, ' ')
+    .replace(/[\n\r*_~`]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  return cleaned ? cleaned.slice(0, 80) : null;
+}
+
+function _safeSenderName(row) {
+  const displayName = _cleanName(row.sender_display_name);
+  if (displayName) return displayName;
+
+  const sender = String(row.sender_jid || '');
+  if (sender.startsWith('history-user:')) {
+    return _cleanName(sender.slice('history-user:'.length)) || '群成员';
+  }
+
+  const [local, domain = ''] = sender.split('@');
+  if (domain === 'c.us' && /^\d+$/u.test(local)) {
+    return local.length > 4 ? `群成员…${local.slice(-4)}` : '群成员';
+  }
+  if (sender) {
+    const fingerprint = crypto.createHash('sha256').update(sender).digest('hex').slice(0, 6);
+    return `群成员-${fingerprint}`;
+  }
+  return '群成员';
 }
 
 function _push(chatId, role, text, name) {
@@ -135,17 +166,14 @@ function getMessages(chatId) {
   if (chat) {
     const rows = persistent.repositories.messages.listRecent(chat.id, {
       limit: MAX,
-      after: persistentClearAfter.get(persistent.authorizedGroupJid) || 0,
+      afterId: persistentClearWatermark.get(persistent.authorizedGroupJid) || 0,
       includeCommands: false,
       includeTombstones: false,
     });
     return rows.map((row) => {
       const text = String(row.body || '').trim().slice(0, 1000);
       if (row.message_type === 'SYSTEM') return { role: 'assistant', content: text };
-      const sender = String(row.sender_jid || '');
-      const name = sender.startsWith('history-user:')
-        ? sender.slice('history-user:'.length)
-        : sender.split('@')[0];
+      const name = _safeSenderName(row);
       return {
         role: 'user',
         content: name ? `${name}: ${text}` : text,
@@ -166,9 +194,12 @@ function getMessages(chatId) {
 function clear(chatId) {
   const chat = _persistentChat(chatId);
   if (chat) {
-    // Do not delete durable report/audit sources. Preserve the old process-local
-    // "start a fresh context" behavior by moving this adapter's read boundary.
-    persistentClearAfter.set(persistent.authorizedGroupJid, _now() + 1);
+    // Do not delete durable report/audit sources. A row-id watermark is stable
+    // even when clear() and the next append share the same millisecond.
+    persistentClearWatermark.set(
+      persistent.authorizedGroupJid,
+      persistent.repositories.messages.highWatermark(chat.id)
+    );
     return;
   }
   store.delete(chatId);

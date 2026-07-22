@@ -48,6 +48,11 @@ class MessageRepository {
       whatsappMessageId: requireString(input.whatsappMessageId, 'whatsappMessageId', { max: 500 }),
       chatId: requireInteger(input.chatId, 'chatId', { min: 1 }),
       senderJid: requireString(input.senderJid, 'senderJid', { max: 200 }),
+      senderDisplayName: optionalString(
+        input.senderDisplayName,
+        'senderDisplayName',
+        { max: 200 }
+      ),
       messageType,
       body: input.body === undefined || input.body === null ? null : String(input.body),
       quotedMessageId: input.quotedMessageId == null
@@ -87,15 +92,15 @@ class MessageRepository {
 
     const created = this.db.prepare(`
       INSERT INTO messages (
-        message_uid, whatsapp_message_id, chat_id, sender_jid, message_type, body,
-        quoted_message_id, quoted_message_chat_id, quoted_whatsapp_message_id,
-        quoted_body, quoted_sender_jid, quoted_sent_at, quoted_media_json,
-        sent_at, received_at, is_command, created_at
+        message_uid, whatsapp_message_id, chat_id, sender_jid, sender_display_name,
+        message_type, body, quoted_message_id, quoted_message_chat_id,
+        quoted_whatsapp_message_id, quoted_body, quoted_sender_jid, quoted_sent_at,
+        quoted_media_json, sent_at, received_at, is_command, created_at
       ) VALUES (
-        @messageUid, @whatsappMessageId, @chatId, @senderJid, @messageType, @body,
-        @quotedMessageId, @quotedMessageChatId, @quotedWhatsappMessageId,
-        @quotedBody, @quotedSenderJid, @quotedSentAt, @quotedMediaJson,
-        @sentAt, @receivedAt, @isCommand, @createdAt
+        @messageUid, @whatsappMessageId, @chatId, @senderJid, @senderDisplayName,
+        @messageType, @body, @quotedMessageId, @quotedMessageChatId,
+        @quotedWhatsappMessageId, @quotedBody, @quotedSenderJid, @quotedSentAt,
+        @quotedMediaJson, @sentAt, @receivedAt, @isCommand, @createdAt
       ) ON CONFLICT(whatsapp_message_id) DO NOTHING RETURNING *
     `).get(values);
     if (created) return { record: created, created: true };
@@ -126,18 +131,33 @@ class MessageRepository {
     const id = requireInteger(chatId, 'chatId', { min: 1 });
     const limit = requireInteger(options.limit ?? 200, 'limit', { min: 1, max: 1000 });
     const after = requireTimestamp(options.after ?? 0, 'after');
+    const afterId = requireInteger(options.afterId ?? 0, 'afterId');
     const includeCommands = options.includeCommands !== false;
     const includeTombstones = options.includeTombstones === true;
     return this.db.prepare(`
       SELECT * FROM (
         SELECT * FROM messages
-        WHERE chat_id = ? AND sent_at >= ?
+        WHERE chat_id = ? AND sent_at >= ? AND id > ?
+          AND body IS NOT NULL
+          -- SQLite trim(X) removes ASCII spaces only. Supply the complete
+          -- Unicode White_Space set so blank rows cannot consume the LIMIT.
+          AND length(trim(body, char(
+            9, 10, 11, 12, 13, 32, 133, 160, 5760,
+            8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202,
+            8232, 8233, 8239, 8287, 12288
+          ))) > 0
           ${includeCommands ? '' : 'AND is_command = 0'}
           ${includeTombstones ? '' : 'AND is_tombstone = 0'}
         ORDER BY sent_at DESC, id DESC
         LIMIT ?
       ) ORDER BY sent_at, id
-    `).all(id, after, limit);
+    `).all(id, after, afterId, limit);
+  }
+
+  highWatermark(chatId) {
+    return this.db.prepare(
+      'SELECT COALESCE(MAX(id), 0) AS id FROM messages WHERE chat_id = ?'
+    ).get(requireInteger(chatId, 'chatId', { min: 1 })).id;
   }
 
   createProcessed(input, options = {}) {

@@ -172,6 +172,28 @@ test('router handles help/missing/unknown, supports injectable handlers, and awa
   ]);
 });
 
+test('router sanitizes reflected unknown names and labels valid summary placeholders as not enabled', async (t) => {
+  const { permissionService } = fixture(t);
+  const replies = [];
+  const message = { reply: async (text) => { replies.push(text); } };
+  const router = createCommandRouter({ permissionService });
+
+  const rawUnknown = `!pm bad\\\n_*~${'x'.repeat(80)}~*_\u0007`;
+  let result = await router.route(message, normalized({ body: rawUnknown }));
+  assert.equal(result.kind, 'unknown');
+  const reflected = replies.pop();
+  const reflectedLines = reflected.split('\n');
+  assert.equal(reflectedLines.length, 2, 'injected newline must not add reply lines');
+  assert.doesNotMatch(reflectedLines[0], /[\r\u0007*_~`]/u);
+  assert.doesNotMatch(reflectedLines[0], /x{41}/u);
+
+  result = await router.route(message, normalized({ body: '!summary 4h' }));
+  assert.equal(result.kind, 'missing-handler');
+  assert.match(replies.pop(), /摘要功能尚未启用/);
+  result = await router.route(message, normalized({ body: '!summary nonsense' }));
+  assert.equal(result.kind, 'unknown');
+});
+
 test('router refuses PM/summary outside the configured enabled group before reply/handler', async (t) => {
   const context = fixture(t);
   let sideEffects = 0;
@@ -199,8 +221,8 @@ test('authorized history is durable across repository restart while commands are
   let now = 2000;
   context.repositories.messages.create({
     messageUid: 'durable-user', whatsappMessageId: 'wa-durable-user',
-    chatId: context.chat.id, senderJid: USER_JID, body: '重启后还在',
-    sentAt: 1900, receivedAt: 1901, isCommand: false,
+    chatId: context.chat.id, senderJid: USER_JID, senderDisplayName: '阿华',
+    body: '重启后还在', sentAt: 1900, receivedAt: 1901, isCommand: false,
   });
   context.repositories.messages.create({
     messageUid: 'durable-command', whatsappMessageId: 'wa-durable-command',
@@ -213,7 +235,7 @@ test('authorized history is durable across repository restart while commands are
   history.appendUser(GROUP_JID, '小明', '兼容 API 写入');
   history.appendAssistant(GROUP_JID, '持久化助手回复');
   assert.deepEqual(history.getMessages(GROUP_JID), [
-    { role: 'user', content: '60111111111: 重启后还在' },
+    { role: 'user', content: '阿华: 重启后还在' },
     { role: 'user', content: '小明: 兼容 API 写入' },
     { role: 'assistant', content: '持久化助手回复' },
   ]);
@@ -225,7 +247,7 @@ test('authorized history is durable across repository restart while commands are
     repositories: restartedRepositories, authorizedGroupJid: GROUP_JID, clock: () => now,
   });
   assert.deepEqual(history.getMessages(GROUP_JID), [
-    { role: 'user', content: '60111111111: 重启后还在' },
+    { role: 'user', content: '阿华: 重启后还在' },
     { role: 'user', content: '小明: 兼容 API 写入' },
     { role: 'assistant', content: '持久化助手回复' },
   ]);
@@ -234,6 +256,36 @@ test('authorized history is durable across repository restart while commands are
   ).get();
   assert.equal(storedAssistant.processing_status, 'PROCESSED');
   assert.equal(storedAssistant.is_command, 0);
+});
+
+test('durable history masks JID fallbacks and clear uses an id watermark at the same millisecond', (t) => {
+  const context = fixture(t);
+  const now = 5000;
+  for (const [uid, senderJid, body, sentAt] of [
+    ['phone-fallback', USER_JID, 'phone text', 4900],
+    ['lid-fallback', 'private-runtime-member@lid', 'lid text', 4901],
+  ]) {
+    context.repositories.messages.create({
+      messageUid: uid, whatsappMessageId: uid, chatId: context.chat.id,
+      senderJid, body, sentAt, receivedAt: sentAt, isCommand: false,
+    });
+  }
+  history.configure({
+    repositories: context.repositories, authorizedGroupJid: GROUP_JID, clock: () => now,
+  });
+  const before = history.getMessages(GROUP_JID);
+  assert.match(before[0].content, /^群成员…1111: phone text$/u);
+  assert.match(before[1].content, /^群成员-[a-f0-9]{6}: lid text$/u);
+  assert.doesNotMatch(
+    before.map((message) => message.content).join('\n'),
+    /60111111111|private-runtime-member/u
+  );
+
+  history.clear(GROUP_JID);
+  history.appendUser(GROUP_JID, '同毫秒成员', 'clear 后可见');
+  assert.deepEqual(history.getMessages(GROUP_JID), [
+    { role: 'user', content: '同毫秒成员: clear 后可见' },
+  ]);
 });
 
 test('direct and non-authorized history retains the legacy in-memory API and return shape', (t) => {

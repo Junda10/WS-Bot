@@ -28,6 +28,24 @@ function requireHandler(handler, name) {
   return handler;
 }
 
+function sanitizeReflectedCommand(value, maxLength = 40) {
+  const cleaned = Array.from(String(value || '')
+    .replace(/[\p{Cc}\p{Cf}]/gu, '')
+    .replace(/[\n\r*_~`]+/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim()).slice(0, maxLength).join('');
+  return cleaned || '(无法显示)';
+}
+
+function isRecognizedSummaryRequest(tokens) {
+  if (tokens.length === 0) return true;
+  if (tokens.length === 1) {
+    return /^(?:today|yesterday|\d+[smhd])$/iu.test(tokens[0]);
+  }
+  return tokens.length === 2 && tokens[0].toLowerCase() === 'since'
+    && tokens[1].trim().length > 0;
+}
+
 class CommandRouter {
   constructor(options = {}) {
     if (!options.permissionService
@@ -105,7 +123,7 @@ class CommandRouter {
       }
       await this._reply(
         message,
-        `❓ 未知或尚未启用的 PM 命令：${parsed.command}\n发送 !pm help 查看可用命令。`
+        `❓ 未知或尚未启用的 PM 命令：${sanitizeReflectedCommand(parsed.command)}\n发送 !pm help 查看可用命令。`
       );
       return Object.freeze({ handled: true, kind: 'unknown', parsed });
     }
@@ -118,13 +136,13 @@ class CommandRouter {
       const value = await this.summaryHandler(context);
       return Object.freeze({ handled: true, kind: 'handler', parsed, value });
     }
-    if (parsed.tokens.length === 0) {
-      await this._reply(message, SUMMARY_HELP);
+    if (isRecognizedSummaryRequest(parsed.tokens)) {
+      await this._reply(message, '⏳ 群聊摘要功能尚未启用，将在后续任务开放。');
       return Object.freeze({ handled: true, kind: 'missing-handler', parsed });
     }
     await this._reply(
       message,
-      `❓ 未知或尚未启用的摘要参数：${parsed.tokens[0]}\n发送 !summary help 查看用法。`
+      `❓ 未知或尚未启用的摘要参数：${sanitizeReflectedCommand(parsed.tokens[0])}\n发送 !summary help 查看用法。`
     );
     return Object.freeze({ handled: true, kind: 'unknown', parsed });
   }
@@ -139,4 +157,6 @@ module.exports = {
   PM_HELP,
   SUMMARY_HELP,
   createCommandRouter,
+  isRecognizedSummaryRequest,
+  sanitizeReflectedCommand,
 };
