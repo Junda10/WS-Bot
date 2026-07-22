@@ -30,6 +30,10 @@ const { ScheduledSummaryService } = require('./summaries/scheduled-summary-servi
 const { PersistentSummaryRunner } = require('./summaries/persistent-summary-runner');
 const { SummaryRecoveryService } = require('./summaries/summary-recovery-service');
 const { PersistentSummaryScheduler } = require('./summaries/persistent-summary-scheduler');
+const { RetentionService } = require('./services/retention-service');
+const { BackupService } = require('./services/backup-service');
+const { FilesystemOffsiteAdapter } = require('./services/filesystem-offsite-adapter');
+const { MaintenanceScheduler } = require('./services/maintenance-scheduler');
 
 const appClock = () => Date.now();
 
@@ -250,6 +254,41 @@ const persistentSummaryScheduler = new PersistentSummaryScheduler({
   timezone: config.reports.timezone,
   logger: console,
 });
+const retentionService = new RetentionService({
+  db: database,
+  repositories,
+  storage: attachmentStorage,
+  messageDays: config.retention.messageDays,
+  replySessionGraceMs: config.retention.replySessionGraceMs,
+  tempFileGraceMs: config.retention.tempFileGraceMs,
+  clock: appClock,
+  logger: console,
+});
+const offsiteBackupAdapter = config.backup.offsiteDirectory
+  ? new FilesystemOffsiteAdapter({
+    destinationDir: config.backup.offsiteDirectory,
+    busyTimeoutMs: config.database.busyTimeoutMs,
+  })
+  : null;
+const backupService = new BackupService({
+  db: database,
+  databasePath: config.database.path,
+  attachmentsDir: config.storage.attachmentsDir,
+  backupDir: config.backup.directory,
+  retentionCount: config.backup.retentionCount,
+  busyTimeoutMs: config.database.busyTimeoutMs,
+  offsiteAdapter: offsiteBackupAdapter,
+  clock: appClock,
+  logger: console,
+});
+const maintenanceScheduler = new MaintenanceScheduler({
+  cron,
+  retention: retentionService,
+  backup: backupService,
+  expression: config.maintenance.cron,
+  timezone: config.maintenance.timezone,
+  logger: console,
+});
 const namespacedCommandRouter = createCommandRouter({
   permissionService,
   pmHandlers,
@@ -328,9 +367,10 @@ async function onWhatsAppReady() {
     }
   }
 
-  // Persistent summary registration is independently idempotent and starts only
-  // after migrations, WhatsApp ready, and authorized-ingress recovery succeeded.
+  // Persistent summary and maintenance registration are independently idempotent
+  // and start only after migrations, WhatsApp ready, and ingress recovery.
   await persistentSummaryScheduler.start();
+  if (config.maintenance.enabled) maintenanceScheduler.start();
 
   if (schedulesRegistered) {
     console.log('ℹ️ 定时任务已注册，跳过重复 ready 初始化');
@@ -1072,6 +1112,11 @@ async function shutdown(signal) {
   console.log(`🛑 ${signal} received, shutting down...`);
 
   persistentSummaryScheduler.stop();
+  try {
+    await maintenanceScheduler.stop();
+  } catch (error) {
+    console.warn(`Maintenance shutdown failed: ${error.message}`);
+  }
   for (const task of legacyCronTasks) {
     try { task.stop?.(); } catch (error) {
       console.warn(`Legacy cron shutdown failed: ${error.message}`);
@@ -1090,6 +1135,11 @@ async function shutdown(signal) {
   const summaryDrain = await persistentSummaryScheduler.drain({ timeoutMs: 10_000 });
   if (summaryDrain.timedOut) {
     console.warn(`Scheduled summary drain timed out with ${summaryDrain.remaining} run(s) still active`);
+  }
+  try {
+    await maintenanceScheduler.drain();
+  } catch (error) {
+    console.warn(`Maintenance drain failed: ${error.message}`);
   }
 
   // Stop admission first, then let accepted handlers finish their durable

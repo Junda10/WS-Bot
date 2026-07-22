@@ -17,6 +17,15 @@ const PARSE_STATUSES = new Set([
   'SAVED_UNPARSED', 'NEEDS_OCR', 'FAILED',
 ]);
 const ATTEMPT_OPERATIONS = new Set(['DOWNLOAD', 'DETECT', 'EXTRACT', 'OCR', 'ARCHIVE']);
+const DELETE_CHUNK_SIZE = 250;
+
+function idChunks(ids) {
+  const batches = [];
+  for (let index = 0; index < ids.length; index += DELETE_CHUNK_SIZE) {
+    batches.push(ids.slice(index, index + DELETE_CHUNK_SIZE));
+  }
+  return batches;
+}
 
 function hydrateBlob(row) {
   if (!row) return null;
@@ -913,20 +922,24 @@ class AttachmentRepository {
         && row.issue_id === null && row.retention_class === 'TEMPORARY');
       if (!eligible) return null;
       const ids = references.map((row) => row.id);
-      const idsJson = JSON.stringify(ids);
       // Processing attempts are lifecycle history for temporary rows only; they
       // are purged together. Issue evidence/history can never enter this branch.
-      this.db.prepare(`
-        DELETE FROM attachment_processing_attempts
-        WHERE attachment_id IN (SELECT value FROM json_each(?))
-      `).run(idsJson);
-      this.db.prepare(`
-        UPDATE attachments SET duplicate_of_attachment_id = NULL
-        WHERE duplicate_of_attachment_id IN (SELECT value FROM json_each(?))
-      `).run(idsJson);
-      this.db.prepare(`
-        DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?))
-      `).run(idsJson);
+      // Bound each JSON parameter so a highly deduplicated blob cannot create an
+      // unbounded SQL value or one giant destructive statement.
+      for (const batch of idChunks(ids)) {
+        const idsJson = JSON.stringify(batch);
+        this.db.prepare(`
+          DELETE FROM attachment_processing_attempts
+          WHERE attachment_id IN (SELECT value FROM json_each(?))
+        `).run(idsJson);
+        this.db.prepare(`
+          UPDATE attachments SET duplicate_of_attachment_id = NULL
+          WHERE duplicate_of_attachment_id IN (SELECT value FROM json_each(?))
+        `).run(idsJson);
+        this.db.prepare(`
+          DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?))
+        `).run(idsJson);
+      }
       const remaining = this.db.prepare(
         'SELECT COUNT(*) AS count FROM attachments WHERE blob_sha256 = ?'
       ).get(hash).count;
@@ -944,25 +957,32 @@ class AttachmentRepository {
         SELECT id, blob_sha256 FROM attachments
         WHERE retention_class = 'TEMPORARY' AND issue_id IS NULL
           AND deleted_at IS NULL AND processing_status <> 'PROCESSING'
+          AND processing_claim_id IS NULL AND processing_lease_until IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM attachment_blobs b
+            WHERE b.sha256 = attachments.blob_sha256
+              AND b.promotion_target_key IS NOT NULL
+          )
           AND COALESCE(source_sent_at, archived_at, created_at) < @cutoff
         ORDER BY id
       `).all({ cutoff: expiresBefore });
       if (candidates.length === 0) return { attachmentIds: [], blobs: [] };
       const ids = candidates.map((row) => row.id);
-      const idsJson = JSON.stringify(ids);
       const hashes = [...new Set(candidates.map((row) => row.blob_sha256).filter(Boolean))];
-      this.db.prepare(`
-        DELETE FROM attachment_processing_attempts
-        WHERE attachment_id IN (SELECT value FROM json_each(?))
-      `).run(idsJson);
-      this.db.prepare(`
-        UPDATE attachments SET duplicate_of_attachment_id = NULL, updated_at = ?
-        WHERE duplicate_of_attachment_id IN (SELECT value FROM json_each(?))
-          AND id NOT IN (SELECT value FROM json_each(?))
-      `).run(timestamp, idsJson, idsJson);
-      this.db.prepare(`
-        DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?))
-      `).run(idsJson);
+      for (const batch of idChunks(ids)) {
+        const idsJson = JSON.stringify(batch);
+        this.db.prepare(`
+          DELETE FROM attachment_processing_attempts
+          WHERE attachment_id IN (SELECT value FROM json_each(?))
+        `).run(idsJson);
+        this.db.prepare(`
+          UPDATE attachments SET duplicate_of_attachment_id = NULL, updated_at = ?
+          WHERE duplicate_of_attachment_id IN (SELECT value FROM json_each(?))
+        `).run(timestamp, idsJson);
+        this.db.prepare(`
+          DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?))
+        `).run(idsJson);
+      }
 
       const blobs = [];
       for (const hash of hashes) {

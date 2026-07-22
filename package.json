@@ -7,6 +7,7 @@
     "start": "node index.js",
     "db:migrate": "node scripts/db-migrate.js",
     "db:check": "node scripts/db-check.js",
+    "db:restore-check": "node scripts/db-restore-check.js",
     "ocr:smoke": "node scripts/ocr-smoke.js",
     "pm-ai:smoke": "node scripts/openrouter-pm-smoke.js",
     "test": "node --test test/*.js",

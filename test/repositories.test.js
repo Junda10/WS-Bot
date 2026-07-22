@@ -89,7 +89,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   `).all().map((row) => row.name);
   for (const table of expectedTables) assert.ok(tables.includes(table), `${table} should exist`);
   assert.ok(tables.includes('issue_fts'));
-  assert.equal(db.pragma('user_version', { simple: true }), 11);
+  assert.equal(db.pragma('user_version', { simple: true }), 12);
   assert.ok(db.prepare(
     "SELECT 1 FROM sqlite_schema WHERE type='index' AND name='issue_events_chat_time_idx'"
   ).get());

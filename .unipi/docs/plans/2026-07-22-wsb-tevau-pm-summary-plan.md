@@ -257,7 +257,7 @@ specs:
     3. 在 DB migration 完成且 WhatsApp ready 后注册任务并执行 recovery。
     4. 测试重复 cron、PM2/WhatsApp 重连、partial send、重启和 missed windows。
 
-- unstarted: Task 17 — 实现保留清理、备份与恢复校验
+- completed: Task 17 — 实现保留清理、备份与恢复校验
   - Description: 清理 30 天普通消息/Markdown 和临时资源，同时保护工单证据；使用在线 SQLite backup 和附件 manifest 建立可验证备份。
   - Dependencies: Tasks 3, 8, 13, 16
   - Acceptance Criteria:

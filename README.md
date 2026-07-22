@@ -95,12 +95,18 @@ PM features are restricted by WhatsApp JID, never display name. Set all three id
 | `DB_PATH` / `DB_BUSY_TIMEOUT_MS` | SQLite location and lock wait | `data/wsb.sqlite3` / `5000` |
 | `PM_ATTACHMENTS_DIR` / `PM_TEMP_DIR` | Archived and temporary media directories | under `data/` |
 | `PM_MAX_FILE_MB` | Maximum attachment size | `20` |
-| `PM_MESSAGE_RETENTION_DAYS` | Ordinary message retention | `30` |
-| `PM_TIMEZONE` / `PM_REPORT_RECOVERY_HOURS` | Report timezone and startup catch-up window | `Asia/Kuala_Lumpur` / `24` |
+| `PM_MESSAGE_RETENTION_DAYS` | Exact UTC ordinary-message/temporary-attachment retention | `30` |
+| `PM_REPLY_SESSION_GRACE_MS` / `PM_TEMP_FILE_GRACE_MS` | Grace before terminal sessions/staging remnants are purged | `86400000` |
+| `PM_MAINTENANCE_ENABLED` / `PM_MAINTENANCE_CRON` | Daily cleanup + backup schedule | `true` / `30 2 * * *` |
+| `PM_TIMEZONE` / `PM_REPORT_RECOVERY_HOURS` | Maintenance/report timezone and startup catch-up window | `Asia/Kuala_Lumpur` / `24` |
 | `PM_OCR_ENABLED` / `PM_OCR_LANGUAGES` | Local OCR switch and languages | `false` / `eng+chi_sim` |
 | `PM_VISION_POLICY` | `off`, `ocr-only`, `ocr-first`, or `vision-first` | `ocr-first` |
-| `PM_BACKUP_DIR` / `PM_BACKUP_RETENTION_COUNT` | Local snapshot directory and count | `data/backups` / `14` |
-| `PM_BACKUP_REMOTE_URL` | Optional off-host backup destination | unset |
+| `PM_BACKUP_DIR` / `PM_BACKUP_RETENTION_COUNT` | Local verified bundle directory and count | `data/backups` / `14` |
+| `PM_BACKUP_OFFSITE_DIR` | Optional separate filesystem/off-host mount | unset |
+
+Retention uses the exact cutoff `sent_at < now - days × 24h`; the boundary itself is retained. Ordinary rows and temporary attachment bytes expire, while issue sources, confirmed replies, append-only audit history, immutable evidence snapshots, and every issue-linked attachment are permanent. Active ingress/attachment leases are never cleaned; stale summary leases are reclaimed only by the existing summary recovery flow.
+
+Backups use SQLite's online backup API (including committed WAL data), then run `integrity_check`, `foreign_key_check`, and migration validation before publication. Each atomic private bundle contains `database.sqlite3`, de-duplicated issue attachment bytes, and a size/SHA-256 manifest. A new verified bundle must succeed before pruning to the newest 14. Offsite failure is recorded but does not invalidate or delete the local bundle. The offsite option only writes to a configured filesystem directory and never invokes a shell.
 
 Runtime databases (including WAL/SHM files), attachments, temporary files, backups, and OCR data are ignored by Git. Never commit the real `.env`.
 
@@ -131,6 +137,18 @@ OPENROUTER_PM_SMOKE=1 npm run pm-ai:smoke -- --run
 ```
 
 It never prints the API key or raw evidence/model output and is not part of `npm test`.
+
+#### Database operations and restore drills
+
+```bash
+npm run db:migrate
+npm run db:check
+npm run db:restore-check -- data/backups/wsb-YYYYMMDDTHHMMSSmmmZ-xxxxxxxx
+# optional isolated parent for the temporary restore area:
+npm run db:restore-check -- /absolute/bundle --temp-dir /absolute/private-temp
+```
+
+`db:restore-check` never opens or overwrites the production database. It stages the selected bundle in a temporary restore area, rejects traversal/symlinks/unknown or missing files, verifies all hashes and sizes, checks SQLite integrity/foreign keys/current migrations, and confirms every live issue attachment represented by the database is present. A failed check must be investigated before using that bundle for a manual restore.
 
 ### Clarification (ask-user threshold) module
 

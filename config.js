@@ -1,6 +1,7 @@
 'use strict';
 
 const path = require('path');
+const cron = require('node-cron');
 
 // Runtime config. All sensitive / per-deployment values come from .env.
 // See .env.example for the required keys.
@@ -151,6 +152,14 @@ function loadConfig(env = process.env) {
 
     retention: {
       messageDays: readInteger(env, 'PM_MESSAGE_RETENTION_DAYS', 30),
+      replySessionGraceMs: readInteger(env, 'PM_REPLY_SESSION_GRACE_MS', 24 * 60 * 60 * 1000),
+      tempFileGraceMs: readInteger(env, 'PM_TEMP_FILE_GRACE_MS', 24 * 60 * 60 * 1000),
+    },
+
+    maintenance: {
+      enabled: readBoolean(env, 'PM_MAINTENANCE_ENABLED', true),
+      cron: String(env.PM_MAINTENANCE_CRON || '30 2 * * *').trim(),
+      timezone,
     },
 
     reports: {
@@ -182,7 +191,9 @@ function loadConfig(env = process.env) {
     backup: {
       directory: path.resolve(root, env.PM_BACKUP_DIR || 'data/backups'),
       retentionCount: readInteger(env, 'PM_BACKUP_RETENTION_COUNT', 14),
-      remoteUrl: String(env.PM_BACKUP_REMOTE_URL || '').trim(),
+      // Preserve a relative configured value so central validation can reject it
+      // rather than silently interpreting it against an arbitrary process cwd.
+      offsiteDirectory: String(env.PM_BACKUP_OFFSITE_DIR || '').trim(),
     },
   };
 }
@@ -278,6 +289,23 @@ function validateConfig(config, { requirePm = true } = {}) {
   );
   integerInRange(config.storage.maxQueuePending, 1, 100_000, 'PM_ATTACHMENT_QUEUE_MAX_PENDING');
   integerInRange(config.retention.messageDays, 1, 3650, 'PM_MESSAGE_RETENTION_DAYS');
+  integerInRange(
+    config.retention.replySessionGraceMs,
+    60_000,
+    365 * 24 * 60 * 60 * 1000,
+    'PM_REPLY_SESSION_GRACE_MS'
+  );
+  integerInRange(
+    config.retention.tempFileGraceMs,
+    60_000,
+    365 * 24 * 60 * 60 * 1000,
+    'PM_TEMP_FILE_GRACE_MS'
+  );
+  validBoolean(config.maintenance.enabled, 'PM_MAINTENANCE_ENABLED');
+  if (!config.maintenance.cron || !cron.validate(config.maintenance.cron)) {
+    errors.push('PM_MAINTENANCE_CRON must be a valid node-cron expression');
+  }
+  validTimezone(config.maintenance.timezone, 'PM_TIMEZONE');
   integerInRange(config.pm.replySessionTtlMs, 60_000, 24 * 60 * 60 * 1000, 'PM_REPLY_SESSION_TTL_MS');
   validTimezone(config.reports.timezone, 'PM_TIMEZONE');
   integerInRange(config.reports.recoveryWindowHours, 1, 168, 'PM_REPORT_RECOVERY_HOURS');
@@ -342,6 +370,23 @@ function validateConfig(config, { requirePm = true } = {}) {
     errors.push(`PM_VISION_POLICY must be one of: ${[...VISION_POLICIES].join(', ')}`);
   }
   integerInRange(config.backup.retentionCount, 1, 365, 'PM_BACKUP_RETENTION_COUNT');
+  const overlaps = (left, right) => {
+    const a = path.resolve(left);
+    const b = path.resolve(right);
+    return a === b || a.startsWith(`${b}${path.sep}`) || b.startsWith(`${a}${path.sep}`);
+  };
+  if (overlaps(config.backup.directory, config.storage.attachmentsDir)
+      || overlaps(config.backup.directory, config.storage.tempDir)) {
+    errors.push('PM_BACKUP_DIR must be separate from PM_ATTACHMENTS_DIR and PM_TEMP_DIR');
+  }
+  if (config.backup.offsiteDirectory && !path.isAbsolute(config.backup.offsiteDirectory)) {
+    errors.push('PM_BACKUP_OFFSITE_DIR must be an absolute path');
+  }
+  if (config.backup.offsiteDirectory && path.isAbsolute(config.backup.offsiteDirectory)
+      && [config.backup.directory, config.storage.attachmentsDir, config.storage.tempDir]
+        .some((directory) => overlaps(config.backup.offsiteDirectory, directory))) {
+    errors.push('PM_BACKUP_OFFSITE_DIR must be separate from local backup/attachment/temp storage');
+  }
 
   if (errors.length) throw new ConfigValidationError(errors);
   return config;

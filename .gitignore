@@ -32,6 +32,8 @@ attachments/
 tmp/
 temp/
 backups/
+.tmp-wsb-*/
+wsb-*-*-*/
 ocr-data/
 ocr-cache/
 .tesseract-cache/

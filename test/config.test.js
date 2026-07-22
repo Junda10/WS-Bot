@@ -36,6 +36,10 @@ test('loads valid PM defaults and normalizes JIDs', () => {
   assert.equal(config.storage.maxExtractedChars, 1_000_000);
   assert.equal(config.storage.processingTimeoutMs, 120_000);
   assert.equal(config.retention.messageDays, 30);
+  assert.equal(config.retention.replySessionGraceMs, 24 * 60 * 60 * 1000);
+  assert.equal(config.retention.tempFileGraceMs, 24 * 60 * 60 * 1000);
+  assert.equal(config.maintenance.enabled, true);
+  assert.equal(config.maintenance.cron, '30 2 * * *');
   assert.equal(config.reports.timezone, 'Asia/Kuala_Lumpur');
   assert.equal(config.reports.recoveryWindowHours, 24);
   assert.equal(config.media.ocrLanguages, 'eng+chi_sim');
@@ -46,6 +50,7 @@ test('loads valid PM defaults and normalizes JIDs', () => {
   assert.equal(config.media.ocrCachePath, path.resolve('data/ocr-cache'));
   assert.equal(config.media.ocrLangPath, path.resolve('data/tessdata'));
   assert.equal(config.backup.retentionCount, 14);
+  assert.equal(config.backup.offsiteDirectory, '');
   assert.equal(config.database.path, path.resolve('data/wsb.sqlite3'));
 });
 
@@ -89,6 +94,10 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
     PM_MAX_EXTRACTED_CHARS: '-1',
     PM_FILE_PROCESSING_TIMEOUT_MS: '999999999',
     PM_MESSAGE_RETENTION_DAYS: '0',
+    PM_REPLY_SESSION_GRACE_MS: '1',
+    PM_TEMP_FILE_GRACE_MS: 'forever',
+    PM_MAINTENANCE_ENABLED: 'yes',
+    PM_MAINTENANCE_CRON: 'not cron',
     PM_REPLY_SESSION_TTL_MS: '1000',
     PM_REPORT_RECOVERY_HOURS: 'forever',
     PM_TIMEZONE: 'Malaysia/Invalid',
@@ -121,6 +130,10 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
       assert.match(error.message, /PM_MAX_EXTRACTED_CHARS/);
       assert.match(error.message, /PM_FILE_PROCESSING_TIMEOUT_MS/);
       assert.match(error.message, /PM_MESSAGE_RETENTION_DAYS/);
+      assert.match(error.message, /PM_REPLY_SESSION_GRACE_MS/);
+      assert.match(error.message, /PM_TEMP_FILE_GRACE_MS/);
+      assert.match(error.message, /PM_MAINTENANCE_ENABLED/);
+      assert.match(error.message, /PM_MAINTENANCE_CRON/);
       assert.match(error.message, /PM_REPORT_RECOVERY_HOURS/);
       assert.match(error.message, /PM_TIMEZONE/);
       assert.match(error.message, /PM_VISION_POLICY/);
@@ -144,6 +157,24 @@ test('rejects configured image pixel ceilings above the 100m hard cap', () => {
     (error) => error instanceof ConfigValidationError
       && /PM_MAX_IMAGE_PIXELS must be an integer from 1 to 100000000/u.test(error.message)
   );
+});
+
+test('central validation uses node-cron syntax and requires an absolute offsite path', () => {
+  assert.throws(
+    () => validateConfig(loadConfig({
+      ...VALID_ENV,
+      PM_MAINTENANCE_CRON: '99 99 * * *',
+      PM_BACKUP_OFFSITE_DIR: 'relative/offsite',
+    })),
+    (error) => error instanceof ConfigValidationError
+      && /PM_MAINTENANCE_CRON/u.test(error.message)
+      && /PM_BACKUP_OFFSITE_DIR must be an absolute path/u.test(error.message)
+  );
+  const absolute = path.resolve('external-backups');
+  assert.equal(validateConfig(loadConfig({
+    ...VALID_ENV,
+    PM_BACKUP_OFFSITE_DIR: absolute,
+  })).backup.offsiteDirectory, absolute);
 });
 
 test('supports validation without PM identities for database-only tools', () => {
