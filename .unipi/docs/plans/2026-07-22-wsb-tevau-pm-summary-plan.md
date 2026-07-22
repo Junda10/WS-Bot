@@ -69,7 +69,7 @@ specs:
     3. 为 issue-linked message 使用保留 tombstone 或可空引用策略。
     4. 使用临时数据库测试所有约束和关键查询。
 
-- unstarted: Task 4 — 实现 JID 权限与工单领域服务
+- completed: Task 4 — 实现 JID 权限与工单领域服务
   - Description: 实现授权群边界、成员/Eric/管理员角色、状态转换、短编号、等待时长和只追加审计事件。
   - Dependencies: Task 3
   - Acceptance Criteria:

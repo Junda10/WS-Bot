@@ -216,11 +216,11 @@ class ReplyMatchRepository {
         INSERT INTO issue_events (
           event_uid, issue_id, chat_id, event_type, actor_jid,
           source_message_id, source_message_chat_id, source_whatsapp_message_id,
-          reply_text, before_json, after_json, occurred_at, created_at
+          reply_text, before_json, after_json, reason, occurred_at, created_at
         ) VALUES (
           @eventUid, @issueId, @chatId, 'REPLY_CONFIRMED', @ericJid,
           @sourceMessageId, @sourceMessageChatId, @sourceWhatsappMessageId,
-          @replyText, @beforeJson, @afterJson, @now, @now
+          @replyText, @beforeJson, @afterJson, @reason, @now, @now
         ) RETURNING *
       `).get({
         eventUid,
@@ -237,6 +237,7 @@ class ReplyMatchRepository {
           firstRepliedAt: updatedIssue.first_replied_at,
           replyId: reply.id,
         }, 'after'),
+        reason: input.reason == null ? null : String(input.reason),
         now,
       });
 

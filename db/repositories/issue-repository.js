@@ -114,7 +114,19 @@ class IssueRepository {
         actorJid: values.createdByJid,
         sourceMessageId: values.sourceMessageId,
         sourceWhatsappMessageId: values.sourceWhatsappMessageId,
-        after: { publicId: issue.public_id, title: issue.title, status: issue.status },
+        after: {
+          publicId: issue.public_id,
+          title: issue.title,
+          description: issue.description,
+          status: issue.status,
+          ownerJid: issue.owner_jid,
+          firstRepliedAt: issue.first_replied_at,
+          resolvedAt: issue.resolved_at,
+          archivedAt: issue.archived_at,
+          deletedAt: issue.deleted_at,
+          revision: issue.revision,
+        },
+        reason: input.reason,
         occurredAt: values.now,
         createdAt: values.now,
       });
@@ -196,6 +208,20 @@ class IssueRepository {
     return includeDeleted || !row || row.deleted_at === null ? row : null;
   }
 
+  findById(id, { includeDeleted = false } = {}) {
+    const row = this.byId.get(requireInteger(id, 'id', { min: 1 })) || null;
+    return includeDeleted || !row || row.deleted_at === null ? row : null;
+  }
+
+  listOpen(chatId) {
+    return this.db.prepare(`
+      SELECT * FROM issues
+      WHERE chat_id = ? AND deleted_at IS NULL
+        AND status IN ('WAITING_TEVAU', 'REPLIED')
+      ORDER BY created_at ASC, id ASC
+    `).all(requireInteger(chatId, 'chatId', { min: 1 }));
+  }
+
   listEvents(issueId) {
     return this.db.prepare(`
       SELECT * FROM issue_events WHERE issue_id = ? ORDER BY occurred_at, id
@@ -248,10 +274,13 @@ class IssueRepository {
     const now = requireTimestamp(input.now, 'now');
     const actorJid = requireString(input.actorJid, 'actorJid', { max: 200 });
     const eventUid = uid(input.eventUid, 'eventUid');
+    const sourceEventUid = uid(input.sourceEventUid, 'sourceEventUid');
     return immediate(this.db, () => {
       const reply = this.db.prepare('SELECT * FROM issue_replies WHERE id = ?').get(replyId);
       if (!reply) throw new Error('Confirmed reply not found');
+      const source = this.byId.get(reply.current_issue_id);
       const target = this.byId.get(targetIssueId);
+      if (!source || source.deleted_at !== null) throw new Error('Source issue not found');
       if (!target || target.deleted_at !== null) throw new Error('Target issue not found');
       if (target.chat_id !== reply.chat_id) throw new Error('Target issue belongs to a different chat');
       if (reply.current_issue_id === targetIssueId) throw new Error('Reply is already linked to target issue');
@@ -274,17 +303,53 @@ class IssueRepository {
         WHERE id IN (@oldId, @targetId)
       `).run({ oldId: oldIssueId, targetId: targetIssueId, now });
 
+      const updatedSource = this.byId.get(oldIssueId);
+      const updatedTarget = this.byId.get(targetIssueId);
+      const movementBefore = {
+        replyId,
+        fromIssueId: oldIssueId,
+        toIssueId: targetIssueId,
+        sourceStatus: source.status,
+        sourceFirstRepliedAt: source.first_replied_at,
+        targetStatus: target.status,
+        targetFirstRepliedAt: target.first_replied_at,
+      };
+      const movementAfter = {
+        replyId,
+        fromIssueId: oldIssueId,
+        toIssueId: targetIssueId,
+        sourceStatus: updatedSource.status,
+        sourceFirstRepliedAt: updatedSource.first_replied_at,
+        targetStatus: updatedTarget.status,
+        targetFirstRepliedAt: updatedTarget.first_replied_at,
+      };
+      const sourceEvent = this.insertEvent({
+        eventUid: sourceEventUid,
+        issueId: oldIssueId,
+        eventType: 'REPLY_MOVED',
+        actorJid,
+        before: movementBefore,
+        after: movementAfter,
+        reason: input.reason,
+        occurredAt: now,
+      });
       const event = this.insertEvent({
         eventUid,
         issueId: targetIssueId,
         eventType: 'REPLY_MOVED',
         actorJid,
-        before: { replyId, issueId: oldIssueId },
-        after: { replyId, issueId: targetIssueId },
+        before: movementBefore,
+        after: movementAfter,
         reason: input.reason,
         occurredAt: now,
       });
-      return { reply: moved, event };
+      return {
+        reply: moved,
+        sourceIssue: updatedSource,
+        targetIssue: updatedTarget,
+        sourceEvent,
+        event,
+      };
     });
   }
 
