@@ -18,6 +18,7 @@ const { normalizeMessage } = require('../whatsapp/normalize-message');
 const GROUP_JID = '120300000000000000@g.us';
 const OTHER_GROUP_JID = '120300000000000001@g.us';
 const USER_JID = '60111111111@c.us';
+const BOT_JID = '60999999999@c.us';
 const LID_JID = 'member-runtime@lid';
 
 function rawMessage(overrides = {}) {
@@ -116,11 +117,67 @@ test('normalizer handles direct/group JIDs, serialized IDs, UTC timestamps, quot
     pageCount: 3, isViewOnce: false,
   });
   assert.deepEqual(group.quoted, {
-    id: 'quoted-id', chatJid: GROUP_JID, senderJid: USER_JID,
+    id: 'quoted-id', chatJid: GROUP_JID, senderJid: USER_JID, fromMe: false,
     body: 'quoted evidence', sentAt: 1_719_999_900_000, media: null,
   });
   assert.equal(downloads, 0, 'normalization must not download media');
   assert.equal(quoteFetches, 0, 'normalization must not fetch quoted content');
+});
+
+test('normalizer uses real whatsapp-web.js quoted id.remote/from/to/fromMe semantics', () => {
+  const outboundBotQuote = normalizeMessage(rawMessage({
+    id: 'command-quoting-bot', from: GROUP_JID, author: USER_JID,
+    body: '!pm add', timestamp: 1_720_000_020,
+    _data: {
+      quotedMsg: {
+        id: {
+          fromMe: true,
+          remote: GROUP_JID,
+          id: 'BOT_MESSAGE_KEY',
+          _serialized: `true_${GROUP_JID}_BOT_MESSAGE_KEY`,
+        },
+        from: { _serialized: BOT_JID },
+        to: { _serialized: GROUP_JID },
+        t: 1_720_000_010,
+        type: 'document',
+        caption: 'bot-supplied evidence',
+        directPath: '/v/t62.7119/example',
+        mimetype: 'application/pdf',
+        filename: 'bot-proof.pdf',
+        size: 4567,
+        pageCount: 4,
+      },
+    },
+  }), { receivedAt: 1_720_000_020_100 });
+
+  assert.equal(outboundBotQuote.quoted.id, `true_${GROUP_JID}_BOT_MESSAGE_KEY`);
+  assert.equal(outboundBotQuote.quoted.chatJid, GROUP_JID, 'id.remote is the conversation');
+  assert.equal(outboundBotQuote.quoted.senderJid, BOT_JID, 'from is the bot sender when fromMe');
+  assert.equal(outboundBotQuote.quoted.fromMe, true);
+  assert.equal(outboundBotQuote.quoted.body, 'bot-supplied evidence');
+  assert.deepEqual(outboundBotQuote.quoted.media, {
+    type: 'document', mimeType: 'application/pdf', fileName: 'bot-proof.pdf',
+    sizeBytes: 4567, width: null, height: null, durationSeconds: null,
+    pageCount: 4, isViewOnce: false,
+  });
+
+  const incomingQuote = normalizeMessage(rawMessage({
+    id: 'command-quoting-member', from: GROUP_JID, author: LID_JID,
+    body: '!pm add', timestamp: 1_720_000_030,
+    _data: {
+      quotedMsg: {
+        id: { fromMe: false, remote: GROUP_JID, _serialized: 'incoming-member-quote' },
+        from: GROUP_JID,
+        to: BOT_JID,
+        author: { _serialized: LID_JID },
+        t: 1_720_000_025,
+        type: 'chat', body: 'member evidence',
+      },
+    },
+  }), { receivedAt: 1_720_000_030_100 });
+  assert.equal(incomingQuote.quoted.chatJid, GROUP_JID);
+  assert.equal(incomingQuote.quoted.senderJid, LID_JID);
+  assert.equal(incomingQuote.quoted.fromMe, false);
 });
 
 test('adapter sends text, ordered parts, quoted replies, and archived attachments through a fake client', async (t) => {
@@ -157,6 +214,36 @@ test('adapter sends text, ordered parts, quoted replies, and archived attachment
   assert.equal(client.sends[3].options.sendMediaAsDocument, true);
   assert.equal(client.sends[3].options.caption, 'archived evidence');
   assert.equal(mediaCalls[0].filePath, archivedPath);
+});
+
+test('wrapIncoming preserves text reply return/options and delegates rich content', async () => {
+  const client = new FakeClient();
+  const richCalls = [];
+  const richResult = { delegated: true };
+  const raw = rawMessage({
+    id: 'reply-source', from: GROUP_JID, author: USER_JID,
+    reply: async (...args) => {
+      richCalls.push(args);
+      return richResult;
+    },
+  });
+  const normalized = normalizeMessage(raw, { receivedAt: 1_720_000_000_100 });
+  const wrapped = new WhatsAppAdapter({ client }).wrapIncoming(raw, normalized);
+
+  const textResult = await wrapped.reply('text reply', OTHER_GROUP_JID, {
+    quotedMessageId: 'caller-cannot-override', linkPreview: false,
+  });
+  assert.equal(textResult.id._serialized, 'sent-1', 'return the underlying WhatsApp Message');
+  assert.deepEqual(client.sends[0], {
+    chatJid: OTHER_GROUP_JID,
+    content: 'text reply',
+    options: { quotedMessageId: 'reply-source', linkPreview: false },
+  });
+
+  const media = { mimetype: 'image/png', data: 'base64' };
+  assert.equal(await wrapped.reply(media, undefined, { caption: 'proof' }), richResult);
+  assert.deepEqual(richCalls[0], [media, undefined, { caption: 'proof' }]);
+  assert.equal(client.sends.length, 1, 'rich reply must be delegated, not coerced to text');
 });
 
 test('authorized ingress persists before routing and stores quote/media metadata without download', async (t) => {
@@ -210,7 +297,13 @@ test('authorized ingress persists before routing and stores quote/media metadata
   assert.equal(persisted.sender_jid, LID_JID);
   assert.equal(persisted.quoted_message_id, quoted.id);
   assert.equal(persisted.quoted_whatsapp_message_id, quoted.whatsapp_message_id);
+  assert.equal(persisted.quoted_body, 'earlier');
+  assert.equal(persisted.quoted_sender_jid, USER_JID);
+  assert.equal(persisted.quoted_sent_at, 1_720_000_000_000);
+  assert.equal(persisted.quoted_media_json, null);
   assert.equal(persisted.message_type, 'MEDIA');
+  assert.equal(persisted.processing_status, 'PROCESSED');
+  assert.equal(persisted.processing_attempt_count, 1);
   const attachment = repositories.attachments.db.prepare(
     'SELECT * FROM attachments WHERE message_id = ?'
   ).get(persisted.id);
@@ -268,7 +361,150 @@ test('memory fast filter and SQLite durable claim prevent duplicate and restart 
   ).get().count, 1);
 });
 
-test('dispatcher preserves direct legacy behavior but rejects cross-chat groups before persistence or routing', async (t) => {
+test('failed routes remain retryable across redelivery/restart and stale leases are reclaimed', async (t) => {
+  const { repositories, permissionService } = fixture(t);
+  const adapter = new WhatsAppAdapter({ client: new FakeClient() });
+  const raw = rawMessage({
+    id: 'retryable-command', from: GROUP_JID, author: USER_JID,
+    body: '!news', timestamp: 1_720_000_040,
+  });
+  let now = 1_720_000_050_000;
+  let routes = 0;
+  const deduper = createMessageDeduper();
+  const route = async () => {
+    routes += 1;
+    if (routes === 1) throw new Error('temporary route outage');
+  };
+  const ingress = new AuthorizedGroupIngress({
+    repositories, permissionService, route, isDuplicate: deduper,
+    clock: () => now, processingLeaseMs: 100,
+  });
+  const handler = createMessageEventHandler({
+    ingress, adapter, routeLegacy: route, isDuplicate: deduper, clock: () => now,
+  });
+
+  await assert.rejects(handler(raw), /temporary route outage/);
+  let row = repositories.messages.findByWhatsappId('retryable-command');
+  assert.equal(row.processing_status, 'FAILED');
+  assert.equal(row.processing_attempt_count, 1);
+  assert.match(row.processing_last_error, /temporary route outage/);
+
+  // The same process's memory filter must not hide unfinished work.
+  assert.equal((await handler(raw)).duplicate, false);
+  row = repositories.messages.findByWhatsappId('retryable-command');
+  assert.equal(row.processing_status, 'PROCESSED');
+  assert.equal(row.processing_attempt_count, 2);
+  assert.equal(routes, 2);
+
+  // Simulate a process dying after claim but before route. A fresh ingress may
+  // not claim the live lease, then reclaims it exactly at expiry.
+  const staleRaw = rawMessage({
+    id: 'stale-processing-command', from: GROUP_JID, author: USER_JID,
+    body: '!news', timestamp: 1_720_000_049,
+  });
+  const normalized = normalizeMessage(staleRaw, { receivedAt: now });
+  const chat = permissionService.assertAuthorizedChat(GROUP_JID);
+  const stalePersisted = ingress.persist(normalized, chat).record;
+  repositories.messages.claimProcessing(stalePersisted.id, {
+    claimId: 'dead-process', now, leaseMs: 100,
+  });
+
+  const restartedDeduper = createMessageDeduper();
+  const restartedIngress = new AuthorizedGroupIngress({
+    repositories, permissionService, route: async () => { routes += 1; },
+    isDuplicate: restartedDeduper, clock: () => now, processingLeaseMs: 100,
+  });
+  const restarted = createMessageEventHandler({
+    ingress: restartedIngress, adapter, routeLegacy: route,
+    isDuplicate: restartedDeduper, clock: () => now,
+  });
+  assert.equal((await restarted(staleRaw)).source, 'sqlite-processing');
+  now += 100;
+  assert.equal((await restarted(staleRaw)).duplicate, false);
+  row = repositories.messages.findByWhatsappId('stale-processing-command');
+  assert.equal(row.processing_status, 'PROCESSED');
+  assert.equal(row.processing_attempt_count, 2);
+});
+
+test('atomic claim prevents concurrent duplicate routes', async (t) => {
+  const { repositories, permissionService } = fixture(t);
+  const adapter = new WhatsAppAdapter({ client: new FakeClient() });
+  let releaseRoute;
+  const routeGate = new Promise((resolve) => { releaseRoute = resolve; });
+  let routes = 0;
+  const ingress = new AuthorizedGroupIngress({
+    repositories,
+    permissionService,
+    route: async () => { routes += 1; await routeGate; },
+    isDuplicate: createMessageDeduper(),
+    clock: () => 1_720_000_100_000,
+  });
+  const handler = createMessageEventHandler({
+    ingress, adapter, routeLegacy: ingress.route,
+    clock: () => 1_720_000_100_000,
+  });
+  const raw = rawMessage({
+    id: 'concurrent-command', from: GROUP_JID, author: USER_JID,
+    body: '!news', timestamp: 1_720_000_090,
+  });
+
+  const first = handler(raw);
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = await handler(raw);
+  assert.equal(second.duplicate, true);
+  assert.equal(second.source, 'ingress-processing');
+  assert.equal(routes, 1);
+  releaseRoute();
+  assert.equal((await first).duplicate, false);
+  assert.equal(repositories.messages.findByWhatsappId(raw.id).processing_status, 'PROCESSED');
+});
+
+test('out-of-order quoted evidence snapshot survives source absence and repository restart', async (t) => {
+  const { repositories, permissionService } = fixture(t);
+  const adapter = new WhatsAppAdapter({ client: new FakeClient() });
+  const ingress = new AuthorizedGroupIngress({
+    repositories, permissionService, route: async () => {},
+    clock: () => 1_720_000_200_000,
+  });
+  const handler = createMessageEventHandler({
+    ingress, adapter, routeLegacy: async () => {}, clock: () => 1_720_000_200_000,
+  });
+  const command = rawMessage({
+    id: 'pm-add-out-of-order', from: GROUP_JID, author: USER_JID,
+    body: '!pm add', timestamp: 1_720_000_190,
+    _data: {
+      quotedMsg: {
+        id: { fromMe: true, remote: GROUP_JID, _serialized: 'missing-bot-source' },
+        from: BOT_JID, to: GROUP_JID, t: 1_720_000_180,
+        type: 'document', caption: 'restart-safe evidence',
+        directPath: '/media/path', mimetype: 'text/markdown',
+        filename: 'evidence.md', size: 321,
+      },
+    },
+  });
+
+  await handler(command);
+  const persisted = repositories.messages.findByWhatsappId('pm-add-out-of-order');
+  assert.equal(persisted.quoted_message_id, null);
+  assert.equal(persisted.quoted_whatsapp_message_id, 'missing-bot-source');
+  assert.equal(persisted.quoted_body, 'restart-safe evidence');
+  assert.equal(persisted.quoted_sender_jid, BOT_JID);
+  assert.equal(persisted.quoted_sent_at, 1_720_000_180_000);
+  assert.deepEqual(JSON.parse(persisted.quoted_media_json), {
+    type: 'document', mimeType: 'text/markdown', fileName: 'evidence.md',
+    sizeBytes: 321, width: null, height: null, durationSeconds: null,
+    pageCount: null, isViewOnce: false,
+  });
+  // A new repository object (the persistence boundary used after restart) sees
+  // the complete snapshot without fetching the absent source from WhatsApp.
+  const restartedRepositories = createRepositories(repositories.messages.db);
+  assert.deepEqual(
+    restartedRepositories.messages.findByWhatsappId('pm-add-out-of-order'),
+    persisted
+  );
+});
+
+test('dispatcher preserves direct and cross-group legacy behavior without PM side effects', async (t) => {
   const { repositories, permissionService } = fixture(t);
   const client = new FakeClient();
   const adapter = new WhatsAppAdapter({ client });
@@ -292,12 +528,76 @@ test('dispatcher preserves direct legacy behavior but rejects cross-chat groups 
   assert.equal(client.sends[0].chatJid, USER_JID);
   assert.equal(repositories.messages.findByWhatsappId('direct-legacy-id'), null);
 
-  await assert.rejects(handler(rawMessage({
+  const otherGroup = await handler(rawMessage({
     id: 'cross-chat-id', from: OTHER_GROUP_JID, author: USER_JID,
-  })), (error) => error.code === 'CHAT_NOT_AUTHORIZED');
-  assert.equal(routes, 1, 'unauthorized group must never reach legacy behavior');
-  assert.equal(client.sends.length, 1);
-  assert.equal(repositories.messages.findByWhatsappId('cross-chat-id'), null);
+    body: '!pm add',
+  }));
+  assert.equal(otherGroup.source, 'legacy-group');
+  assert.equal(routes, 2, 'non-authorized groups must retain legacy routing');
+  assert.equal(client.sends.length, 2);
+  assert.equal(client.sends[1].chatJid, OTHER_GROUP_JID);
+  assert.equal(repositories.messages.findByWhatsappId('cross-chat-id'), null,
+    'cross-group legacy commands must have no PM persistence side effect');
+});
+
+test('stop-accepting and bounded drain wait for an in-flight route before shutdown', async (t) => {
+  const { repositories, permissionService } = fixture(t);
+  const adapter = new WhatsAppAdapter({ client: new FakeClient() });
+  let releaseRoute;
+  let routeStarted;
+  const started = new Promise((resolve) => { routeStarted = resolve; });
+  const gate = new Promise((resolve) => { releaseRoute = resolve; });
+  const ingress = new AuthorizedGroupIngress({
+    repositories,
+    permissionService,
+    route: async () => { routeStarted(); await gate; },
+    clock: () => 1_720_000_300_000,
+  });
+  const handler = createMessageEventHandler({
+    ingress, adapter, routeLegacy: async () => {}, clock: () => 1_720_000_300_000,
+  });
+  const active = handler(rawMessage({
+    id: 'shutdown-active-route', from: GROUP_JID, author: USER_JID,
+    timestamp: 1_720_000_290,
+  }));
+  await started;
+  assert.equal(handler.inFlightCount(), 1);
+  assert.equal(handler.stopAccepting(), 1);
+  assert.deepEqual(await handler(rawMessage({
+    id: 'shutdown-rejected-route', from: GROUP_JID, author: USER_JID,
+  })), { accepted: false, duplicate: false, source: 'stopping' });
+  assert.equal(repositories.messages.findByWhatsappId('shutdown-rejected-route'), null);
+
+  const timedOut = await handler.drain({ timeoutMs: 1 });
+  assert.equal(timedOut.timedOut, true);
+  assert.equal(timedOut.remaining, 1);
+  const draining = handler.drain({ timeoutMs: 1000 });
+  releaseRoute();
+  assert.equal((await active).record.processing_status, 'PROCESSED');
+  assert.deepEqual(await draining, { drained: true, timedOut: false, remaining: 0 });
+  assert.equal(handler.inFlightCount(), 0);
+});
+
+test('legacy route failure is not retained by the memory deduper', async (t) => {
+  const { repositories, permissionService } = fixture(t);
+  const deduper = createMessageDeduper();
+  let attempts = 0;
+  const handler = createMessageEventHandler({
+    ingress: new AuthorizedGroupIngress({
+      repositories, permissionService, route: async () => {},
+    }),
+    adapter: new WhatsAppAdapter({ client: new FakeClient() }),
+    isDuplicate: deduper,
+    routeLegacy: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('legacy temporary failure');
+    },
+    clock: () => 1_720_000_400_000,
+  });
+  const direct = rawMessage({ id: 'legacy-retry', from: USER_JID, timestamp: 1_720_000_390 });
+  await assert.rejects(handler(direct), /legacy temporary failure/);
+  assert.equal((await handler(direct)).duplicate, false);
+  assert.equal(attempts, 2);
 });
 
 test('disabled authorized chat rejects before persistence and route side effects', async (t) => {

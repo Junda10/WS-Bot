@@ -1,8 +1,10 @@
 'use strict';
 
+const crypto = require('crypto');
 const {
   assertIdempotent,
   booleanInteger,
+  jsonValue,
   optionalString,
   requireDatabase,
   requireInteger,
@@ -17,11 +19,30 @@ class MessageRepository {
   constructor(db) {
     this.db = requireDatabase(db);
     this.byWhatsappId = db.prepare('SELECT * FROM messages WHERE whatsapp_message_id = ?');
+    this.claimStatement = db.prepare(`
+      UPDATE messages
+      SET processing_status = 'PROCESSING',
+          processing_attempt_count = processing_attempt_count + 1,
+          processing_claim_id = @claimId,
+          processing_started_at = @now,
+          processing_lease_expires_at = @leaseExpiresAt,
+          processing_completed_at = NULL,
+          processing_last_error = NULL
+      WHERE id = @id
+        AND (
+          processing_status IN ('PENDING', 'FAILED')
+          OR (processing_status = 'PROCESSING' AND processing_lease_expires_at <= @now)
+        )
+      RETURNING *
+    `);
   }
 
   create(input) {
     const messageType = (input.messageType || 'TEXT').toUpperCase();
     if (!MESSAGE_TYPES.has(messageType)) throw new TypeError(`Unsupported messageType: ${messageType}`);
+    const quotedBody = input.quotedBody === undefined || input.quotedBody === null
+      ? null
+      : String(input.quotedBody);
     const values = {
       messageUid: uid(input.messageUid, 'messageUid'),
       whatsappMessageId: requireString(input.whatsappMessageId, 'whatsappMessageId', { max: 500 }),
@@ -38,6 +59,12 @@ class MessageRepository {
         'quotedWhatsappMessageId',
         { max: 500 }
       ),
+      quotedBody,
+      quotedSenderJid: optionalString(input.quotedSenderJid, 'quotedSenderJid', { max: 200 }),
+      quotedSentAt: input.quotedSentAt == null
+        ? null
+        : requireTimestamp(input.quotedSentAt, 'quotedSentAt'),
+      quotedMediaJson: jsonValue(input.quotedMedia, 'quotedMedia'),
       sentAt: requireTimestamp(input.sentAt, 'sentAt'),
       receivedAt: requireTimestamp(input.receivedAt, 'receivedAt'),
       isCommand: booleanInteger(input.isCommand),
@@ -61,12 +88,14 @@ class MessageRepository {
     const created = this.db.prepare(`
       INSERT INTO messages (
         message_uid, whatsapp_message_id, chat_id, sender_jid, message_type, body,
-        quoted_message_id, quoted_message_chat_id, quoted_whatsapp_message_id, sent_at, received_at,
-        is_command, created_at
+        quoted_message_id, quoted_message_chat_id, quoted_whatsapp_message_id,
+        quoted_body, quoted_sender_jid, quoted_sent_at, quoted_media_json,
+        sent_at, received_at, is_command, created_at
       ) VALUES (
         @messageUid, @whatsappMessageId, @chatId, @senderJid, @messageType, @body,
-        @quotedMessageId, @quotedMessageChatId, @quotedWhatsappMessageId, @sentAt, @receivedAt,
-        @isCommand, @createdAt
+        @quotedMessageId, @quotedMessageChatId, @quotedWhatsappMessageId,
+        @quotedBody, @quotedSenderJid, @quotedSentAt, @quotedMediaJson,
+        @sentAt, @receivedAt, @isCommand, @createdAt
       ) ON CONFLICT(whatsapp_message_id) DO NOTHING RETURNING *
     `).get(values);
     if (created) return { record: created, created: true };
@@ -91,6 +120,59 @@ class MessageRepository {
     return this.db.prepare('SELECT * FROM messages WHERE id = ?').get(
       requireInteger(id, 'id', { min: 1 })
     ) || null;
+  }
+
+  claimProcessing(id, options = {}) {
+    const messageId = requireInteger(id, 'id', { min: 1 });
+    const now = requireTimestamp(options.now, 'now');
+    const leaseMs = requireInteger(options.leaseMs, 'leaseMs', { min: 1 });
+    if (now + leaseMs > Number.MAX_SAFE_INTEGER) throw new RangeError('processing lease is too large');
+    const claimId = optionalString(options.claimId, 'claimId', { max: 200 }) || crypto.randomUUID();
+    return this.claimStatement.get({
+      id: messageId,
+      claimId,
+      now,
+      leaseExpiresAt: now + leaseMs,
+    }) || null;
+  }
+
+  markProcessed(id, claimId, completedAt) {
+    return this.db.prepare(`
+      UPDATE messages
+      SET processing_status = 'PROCESSED',
+          processing_claim_id = NULL,
+          processing_lease_expires_at = NULL,
+          processing_completed_at = @completedAt,
+          processing_last_error = NULL
+      WHERE id = @id AND processing_status = 'PROCESSING'
+        AND processing_claim_id = @claimId
+      RETURNING *
+    `).get({
+      id: requireInteger(id, 'id', { min: 1 }),
+      claimId: requireString(claimId, 'claimId', { max: 200 }),
+      completedAt: requireTimestamp(completedAt, 'completedAt'),
+    }) || null;
+  }
+
+  markFailed(id, claimId, error, failedAt) {
+    requireTimestamp(failedAt, 'failedAt');
+    const message = String(error?.message || error || 'Message route failed').trim()
+      || 'Message route failed';
+    return this.db.prepare(`
+      UPDATE messages
+      SET processing_status = 'FAILED',
+          processing_claim_id = NULL,
+          processing_lease_expires_at = NULL,
+          processing_completed_at = NULL,
+          processing_last_error = @lastError
+      WHERE id = @id AND processing_status = 'PROCESSING'
+        AND processing_claim_id = @claimId
+      RETURNING *
+    `).get({
+      id: requireInteger(id, 'id', { min: 1 }),
+      claimId: requireString(claimId, 'claimId', { max: 200 }),
+      lastError: message.slice(0, 4000),
+    }) || null;
   }
 
   listWindow(chatId, start, end, { includeCommands = true, includeTombstones = false } = {}) {

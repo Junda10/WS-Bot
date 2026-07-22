@@ -540,7 +540,7 @@ const handleIncomingMessage = createMessageEventHandler({
   routeLegacy: routeExistingMessage,
   isDuplicate: isDuplicateMessage,
 });
-client.on('message', (message) => {
+function onClientMessage(message) {
   handleIncomingMessage(message).catch((error) => {
     if (error.code === 'CHAT_NOT_AUTHORIZED' || error.code === 'CHAT_DISABLED') {
       console.warn(`⚠️ 忽略未授权或已停用的群聊消息 (${error.code})`);
@@ -548,7 +548,8 @@ client.on('message', (message) => {
     }
     console.error(`WhatsApp message ingress failed: ${error.message}`);
   });
-});
+}
+client.on('message', onClientMessage);
 
 // Anti-ban human pause: pace the reply like a human typing. The target delay scales
 // with the reply length (base thinking time + per-char typing time), is jittered, and
@@ -853,13 +854,29 @@ async function shutdown(signal) {
     reinitTimer = null;
   }
 
-  // Close the synchronous database first so it is never left open while the
-  // asynchronous WhatsApp/Puppeteer teardown is waiting.
-  closeDatabase(database);
+  // Stop admission first, then let accepted handlers finish their durable
+  // PROCESSED/FAILED transition before either transport or database disappears.
+  handleIncomingMessage.stopAccepting();
+  client.off?.('message', onClientMessage);
+  try {
+    const drain = await handleIncomingMessage.drain({ timeoutMs: 10_000 });
+    if (drain.timedOut) {
+      console.warn(`WhatsApp ingress drain timed out with ${drain.remaining} handler(s) still active`);
+    }
+  } catch (error) {
+    console.warn(`WhatsApp ingress drain failed: ${error.message}`);
+  }
+
   try {
     await client.destroy();
   } catch (error) {
     console.warn(`WhatsApp client shutdown failed: ${error.message}`);
+  } finally {
+    try {
+      closeDatabase(database);
+    } catch (error) {
+      console.warn(`Database shutdown failed: ${error.message}`);
+    }
   }
   process.exit(0);
 }

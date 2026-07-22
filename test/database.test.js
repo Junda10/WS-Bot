@@ -63,6 +63,51 @@ test('file-backed database applies migrations once and records checksummed metad
   assert.ok(rows.every((row) => /^[a-f0-9]{64}$/.test(row.checksum)));
 });
 
+test('project migration 003 upgrades routed rows and adds durable ingress state safely', (t) => {
+  const fixture = makeFixture(t);
+  const projectMigrations = path.join(__dirname, '..', 'db', 'migrations');
+  for (const name of ['001_database_baseline.sql', '002_pm_domain_schema.sql']) {
+    fs.copyFileSync(path.join(projectMigrations, name), path.join(fixture.migrationsDir, name));
+  }
+  const db = openFixture(t, fixture);
+  migrateDatabase(db, { migrationsDir: fixture.migrationsDir, now: () => 1 });
+  db.exec(`
+    INSERT INTO chats (chat_uid, jid, timezone, created_at, updated_at)
+    VALUES ('upgrade-chat', '120300000000000000@g.us', 'UTC', 10, 10);
+    INSERT INTO messages (
+      message_uid, whatsapp_message_id, chat_id, sender_jid, body,
+      sent_at, received_at, created_at
+    ) VALUES (
+      'pre-003-message', 'pre-003-message', 1, '601@c.us', 'already routed',
+      20, 21, 21
+    );
+  `);
+
+  fs.copyFileSync(
+    path.join(projectMigrations, '003_durable_message_ingress.sql'),
+    path.join(fixture.migrationsDir, '003_durable_message_ingress.sql')
+  );
+  assert.deepEqual(migrateDatabase(db, {
+    migrationsDir: fixture.migrationsDir, now: () => 2,
+  }), { applied: [3], currentVersion: 3 });
+  const existing = db.prepare(
+    "SELECT processing_status, processing_attempt_count, processing_completed_at FROM messages WHERE whatsapp_message_id='pre-003-message'"
+  ).get();
+  assert.deepEqual(existing, {
+    processing_status: 'PROCESSED', processing_attempt_count: 1, processing_completed_at: 21,
+  });
+  db.prepare(`
+    INSERT INTO messages (
+      message_uid, whatsapp_message_id, chat_id, sender_jid, body,
+      sent_at, received_at, created_at
+    ) VALUES ('post-003-message', 'post-003-message', 1, '601@c.us', 'pending', 30, 31, 31)
+  `).run();
+  assert.equal(db.prepare(
+    "SELECT processing_status FROM messages WHERE whatsapp_message_id='post-003-message'"
+  ).get().processing_status, 'PENDING');
+  assert.deepEqual(db.pragma('foreign_key_check'), []);
+});
+
 test('production PRAGMAs and private POSIX permissions are effective on disk', (t) => {
   const fixture = makeFixture(t);
   const db = openFixture(t, fixture);

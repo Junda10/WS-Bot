@@ -86,19 +86,29 @@ class WhatsAppAdapter {
   }
 
   /**
-   * Preserve the legacy Message interface while routing replies through this
-   * adapter, allowing the existing command/smart-reply code to stay unchanged.
+   * Preserve whatsapp-web.js Message.reply() semantics for legacy handlers.
+   * Text remains routed through the injectable client and returns its real
+   * Message result. Rich content is delegated to the original method because
+   * whatsapp-web.js owns its MessageMedia/Location compatibility behavior.
    */
   wrapIncoming(message, normalized) {
     const adapter = this;
+    const originalReply = typeof message.reply === 'function' ? message.reply.bind(message) : null;
     return new Proxy(message, {
       get(target, property, receiver) {
         if (property === 'reply') {
           return async (content, chatId, options = {}) => {
+            if (typeof content !== 'string' && originalReply) {
+              return originalReply(content, chatId, options);
+            }
+
             const targetJid = chatId || normalized.chatJid;
-            return adapter.sendText(targetJid, content, {
-              quotedMessageId: options.quotedMessageId || normalized.id,
-              sendOptions: options,
+            if (!targetJid) throw new TypeError('reply requires a target chat JID');
+            // Message.reply() always quotes the receiving message, overriding any
+            // caller-provided quotedMessageId, and returns client.sendMessage().
+            return adapter.client.sendMessage(targetJid, content, {
+              ...options,
+              quotedMessageId: normalized.id,
             });
           };
         }

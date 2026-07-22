@@ -89,7 +89,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   `).all().map((row) => row.name);
   for (const table of expectedTables) assert.ok(tables.includes(table), `${table} should exist`);
   assert.ok(tables.includes('issue_fts'));
-  assert.equal(db.pragma('user_version', { simple: true }), 2);
+  assert.equal(db.pragma('user_version', { simple: true }), 3);
   assert.deepEqual(db.pragma('foreign_key_check'), []);
   assert.deepEqual(
     db.prepare("SELECT name, next_value, updated_at FROM sequences WHERE name='issue_tv'").get(),
@@ -98,6 +98,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   for (const trigger of [
     'issue_replies_fts_insert', 'issue_replies_fts_move',
     'issue_events_append_only_update', 'summary_parts_insert_guard',
+    'messages_processing_state_update_guard', 'messages_quoted_evidence_immutable',
   ]) {
     assert.ok(db.prepare(
       "SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=?"
@@ -217,14 +218,30 @@ test('message repository is idempotent, derives immutable quote snapshots, and e
   const chatOne = seedChat(repositories, 'one');
   const chatTwo = seedChat(repositories, 'two', 1001);
   const quoted = seedMessage(repositories, chatOne.id, 'quoted', 2000);
+  const quotedMedia = {
+    type: 'document', mimeType: 'application/pdf', fileName: 'proof.pdf',
+    sizeBytes: 91, width: null, height: null, durationSeconds: null,
+    pageCount: 2, isViewOnce: false,
+  };
   const reply = seedMessage(repositories, chatOne.id, 'reply', 2100, {
     quotedMessageId: quoted.id,
+    quotedBody: 'immutable quoted evidence',
+    quotedSenderJid: '60999999999@c.us',
+    quotedSentAt: 1999,
+    quotedMedia,
   });
   assert.equal(reply.quoted_whatsapp_message_id, quoted.whatsapp_message_id);
   assert.equal(reply.quoted_message_chat_id, chatOne.id);
+  assert.equal(reply.quoted_body, 'immutable quoted evidence');
+  assert.equal(reply.quoted_sender_jid, '60999999999@c.us');
+  assert.equal(reply.quoted_sent_at, 1999);
+  assert.deepEqual(JSON.parse(reply.quoted_media_json), quotedMedia);
   assert.throws(() => db.prepare(
     'UPDATE messages SET quoted_whatsapp_message_id = ? WHERE id = ?'
   ).run('changed', reply.id), /immutable/);
+  assert.throws(() => db.prepare(
+    'UPDATE messages SET quoted_body = ? WHERE id = ?'
+  ).run('rewritten evidence', reply.id), /immutable/);
 
   const other = seedMessage(repositories, chatTwo.id, 'other-chat', 2200);
   assert.throws(() => seedMessage(repositories, chatOne.id, 'cross-quote', 2300, {
@@ -255,6 +272,49 @@ test('message repository is idempotent, derives immutable quote snapshots, and e
   assert.equal(repositories.messages.findByWhatsappId(reply.whatsapp_message_id, {
     includeTombstone: false,
   }), null);
+});
+
+test('message processing claims are atomic, retryable, lease-aware, and ownership guarded', (t) => {
+  const { db, repositories } = fixture(t);
+  const chat = seedChat(repositories);
+  const message = seedMessage(repositories, chat.id, 'processing', 2000);
+  assert.equal(message.processing_status, 'PENDING');
+  assert.equal(message.processing_attempt_count, 0);
+
+  const first = repositories.messages.claimProcessing(message.id, {
+    claimId: 'claim-one', now: 2100, leaseMs: 100,
+  });
+  assert.equal(first.processing_status, 'PROCESSING');
+  assert.equal(first.processing_attempt_count, 1);
+  assert.equal(first.processing_lease_expires_at, 2200);
+  assert.equal(repositories.messages.claimProcessing(message.id, {
+    claimId: 'claim-concurrent', now: 2199, leaseMs: 100,
+  }), null, 'a live lease must exclude a concurrent route');
+  assert.equal(repositories.messages.markProcessed(message.id, 'wrong-owner', 2150), null);
+
+  const stale = repositories.messages.claimProcessing(message.id, {
+    claimId: 'claim-stale-recovery', now: 2200, leaseMs: 100,
+  });
+  assert.equal(stale.processing_attempt_count, 2);
+  assert.equal(repositories.messages.markFailed(
+    message.id, stale.processing_claim_id, new Error('temporary route failure'), 2250
+  ).processing_status, 'FAILED');
+
+  const retry = repositories.messages.claimProcessing(message.id, {
+    claimId: 'claim-retry', now: 2251, leaseMs: 100,
+  });
+  assert.equal(retry.processing_attempt_count, 3);
+  const processed = repositories.messages.markProcessed(message.id, 'claim-retry', 2260);
+  assert.equal(processed.processing_status, 'PROCESSED');
+  assert.equal(processed.processing_completed_at, 2260);
+  assert.equal(processed.processing_last_error, null);
+  assert.equal(repositories.messages.claimProcessing(message.id, {
+    claimId: 'claim-after-success', now: 9999, leaseMs: 100,
+  }), null);
+  assert.throws(() => db.prepare(
+    "UPDATE messages SET processing_status='PROCESSING' WHERE id=?"
+  ).run(message.id), /invalid message processing state/);
+  assert.deepEqual(db.pragma('foreign_key_check'), []);
 });
 
 test('issue creation is transactional and TV sequence never reuses deleted or rolled-back numbers', (t) => {

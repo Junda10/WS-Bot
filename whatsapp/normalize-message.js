@@ -75,20 +75,28 @@ function mediaMetadata(source) {
 
 function normalizedQuote(message, chatJid, normalizeJid) {
   const data = message._data || {};
+  // whatsapp-web.js leaves quotedMsg as a serialized message model inside
+  // Message._data; it is not a patched Message instance. In particular, an
+  // outgoing bot message quoted in a group has from=<bot>, to=<group>, and
+  // id.remote=<group>. Treating `from` as the chat therefore loses both chat and
+  // sender identity. Match Message._getChatId(): id.remote is authoritative,
+  // followed by fromMe ? to : from.
   const quoted = data.quotedMsg || message.quotedMessage || null;
   const quoteId = serializedId(quoted?.id)
     || serializedId(data.quotedMessageId)
     || serializedId(data.quotedStanzaID);
   if (!quoted && !message.hasQuotedMsg && !quoteId) return null;
 
-  const quotedChatJid = normalizeChatJid(
-    quoted?.from || quoted?.id?.remote || data.quotedRemoteJid || chatJid,
-    normalizeJid
-  ) || chatJid;
-  const senderJid = normalizeUserJid(
-    quoted?.author || quoted?.id?.participant || data.quotedParticipant,
-    normalizeJid
-  ) || null;
+  const quoteFromMe = Boolean(quoted?.id?.fromMe ?? quoted?.fromMe);
+  const quotedRemote = quoted?.id?.remote || data.quotedRemoteJid;
+  const quotedConversation = quotedRemote || (quoteFromMe ? quoted?.to : quoted?.from) || chatJid;
+  const quotedChatJid = normalizeChatJid(quotedConversation, normalizeJid) || chatJid;
+  const quotedIsGroup = quotedChatJid.endsWith('@g.us');
+  const senderCandidate = quoted?.author
+    || quoted?.id?.participant
+    || data.quotedParticipant
+    || (quoteFromMe ? quoted?.from : (!quotedIsGroup ? quoted?.from : null));
+  const senderJid = normalizeUserJid(senderCandidate, normalizeJid) || null;
   let sentAt = null;
   const rawTimestamp = quoted?.timestamp ?? quoted?.t;
   if (rawTimestamp !== undefined && rawTimestamp !== null) {
@@ -99,7 +107,8 @@ function normalizedQuote(message, chatJid, normalizeJid) {
     id: quoteId || null,
     chatJid: quotedChatJid,
     senderJid,
-    body: String(quoted?.body || quoted?.caption || ''),
+    fromMe: quoteFromMe,
+    body: String(quoted?.body ?? quoted?.caption ?? ''),
     sentAt,
     media: mediaMetadata(quoted),
   });

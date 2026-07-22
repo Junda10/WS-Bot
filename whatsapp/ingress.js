@@ -1,6 +1,10 @@
 'use strict';
 
+const crypto = require('crypto');
 const { normalizeMessage } = require('./normalize-message');
+
+const DEFAULT_PROCESSING_LEASE_MS = 10 * 60 * 1000;
+const DEFAULT_DRAIN_TIMEOUT_MS = 10 * 1000;
 
 class AuthorizedGroupIngress {
   constructor(options = {}) {
@@ -18,6 +22,16 @@ class AuthorizedGroupIngress {
     this.route = options.route;
     this.isDuplicate = options.isDuplicate || (() => false);
     this.logger = options.logger || console;
+    this.clock = options.clock || Date.now;
+    this.processingLeaseMs = options.processingLeaseMs ?? DEFAULT_PROCESSING_LEASE_MS;
+    if (!Number.isSafeInteger(this.processingLeaseMs) || this.processingLeaseMs < 1) {
+      throw new TypeError('processingLeaseMs must be a positive safe integer');
+    }
+    this.activeMessageIds = new Set();
+  }
+
+  accepts(chatJid) {
+    return chatJid === this.permissionService.authorizedChatJid;
   }
 
   persist(normalized, chat) {
@@ -36,6 +50,10 @@ class AuthorizedGroupIngress {
         body: normalized.body,
         quotedMessageId,
         quotedWhatsappMessageId: normalized.quoted?.id || null,
+        quotedBody: normalized.quoted?.body ?? null,
+        quotedSenderJid: normalized.quoted?.senderJid || null,
+        quotedSentAt: normalized.quoted?.sentAt ?? null,
+        quotedMedia: normalized.quoted?.media ?? null,
         sentAt: normalized.sentAt,
         receivedAt: normalized.receivedAt,
         isCommand: normalized.isCommand,
@@ -60,33 +78,115 @@ class AuthorizedGroupIngress {
     });
   }
 
+  _now(notBefore = 0) {
+    const value = this.clock();
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new TypeError('ingress clock must return a non-negative safe integer');
+    }
+    return Math.max(value, notBefore);
+  }
+
+  _rememberProcessed(messageId) {
+    if (typeof this.isDuplicate.remember === 'function') {
+      this.isDuplicate.remember(messageId);
+    } else {
+      this.isDuplicate(messageId);
+    }
+  }
+
   async handle(normalized, message) {
-    // Boundary check intentionally precedes dedupe, persistence, media access,
-    // AI, and all legacy behavior. A duplicate ID from another chat cannot use
-    // the fast filter to bypass authorization.
+    // Only this ingress is authorization-scoped. The dispatcher deliberately
+    // sends every other group/direct chat to the unchanged legacy route.
     const chat = this.permissionService.assertAuthorizedChat(normalized.chatJid);
-    if (this.isDuplicate(normalized.id)) {
-      this.logger.warn?.(`Ignoring duplicate WhatsApp event (fast filter): ${normalized.id}`);
-      return { accepted: true, duplicate: true, source: 'memory' };
-    }
 
-    // The UNIQUE whatsapp_message_id constraint is the durable claim. Routing is
-    // at-most-once: a crash/restart replay observes created=false and cannot repeat
-    // a command, outbound send, AI call, or other legacy business side effect.
+    // Persistence always precedes the durable claim. A memory hit is advisory
+    // only and is never allowed to hide PENDING, FAILED, or stale PROCESSING.
     const persisted = this.persist(normalized, chat);
-    if (!persisted.created) {
-      this.logger.warn?.(`Ignoring duplicate WhatsApp event (SQLite): ${normalized.id}`);
-      return { accepted: true, duplicate: true, source: 'sqlite', record: persisted.record };
+    const knownProcessed = persisted.record.processing_status === 'PROCESSED';
+    const memoryDuplicate = typeof this.isDuplicate.has === 'function'
+      ? this.isDuplicate.has(normalized.id)
+      : false;
+    if (knownProcessed) {
+      this._rememberProcessed(normalized.id);
+      this.logger.warn?.(`Ignoring processed WhatsApp event (${memoryDuplicate ? 'memory' : 'SQLite'}): ${normalized.id}`);
+      return {
+        accepted: true,
+        duplicate: true,
+        source: memoryDuplicate ? 'memory' : 'sqlite',
+        record: persisted.record,
+      };
     }
 
-    await this.route(message, normalized, persisted.record);
-    return {
-      accepted: true,
-      duplicate: false,
-      source: 'sqlite',
-      record: persisted.record,
-      attachment: persisted.attachment,
-    };
+    if (this.activeMessageIds.has(normalized.id)) {
+      return {
+        accepted: true,
+        duplicate: true,
+        source: 'ingress-processing',
+        record: this.repositories.messages.findById(persisted.record.id),
+      };
+    }
+
+    const claimNow = this._now(normalized.receivedAt);
+    const claimed = this.repositories.messages.claimProcessing(persisted.record.id, {
+      now: claimNow,
+      leaseMs: this.processingLeaseMs,
+      claimId: crypto.randomUUID(),
+    });
+    if (!claimed) {
+      const current = this.repositories.messages.findById(persisted.record.id);
+      // Another live handler owns the lease. This is the process- and
+      // database-wide concurrency gate protecting legacy side effects.
+      return {
+        accepted: true,
+        duplicate: true,
+        source: current?.processing_status === 'PROCESSING' ? 'sqlite-processing' : 'sqlite',
+        record: current,
+      };
+    }
+
+    this.activeMessageIds.add(normalized.id);
+    try {
+      try {
+        await this.route(message, normalized, claimed);
+      } catch (routeError) {
+        try {
+          const failed = this.repositories.messages.markFailed(
+            claimed.id,
+            claimed.processing_claim_id,
+            routeError,
+            this._now(claimNow)
+          );
+          if (!failed) {
+            this.logger.error?.(`Lost processing claim while recording failure: ${normalized.id}`);
+          }
+        } catch (markError) {
+          this.logger.error?.(
+            `Could not record failed WhatsApp route ${normalized.id}: ${markError.message}`
+          );
+        }
+        if (typeof this.isDuplicate.forget === 'function') this.isDuplicate.forget(normalized.id);
+        throw routeError;
+      }
+
+      const processed = this.repositories.messages.markProcessed(
+        claimed.id,
+        claimed.processing_claim_id,
+        this._now(claimNow)
+      );
+      if (!processed) {
+        throw new Error(`Lost processing claim before completion: ${normalized.id}`);
+      }
+      this._rememberProcessed(normalized.id);
+      return {
+        accepted: true,
+        duplicate: false,
+        source: 'sqlite',
+        record: processed,
+        attachment: persisted.attachment,
+      };
+    } finally {
+      this.activeMessageIds.delete(normalized.id);
+    }
   }
 }
 
@@ -101,24 +201,84 @@ function createMessageEventHandler(options = {}) {
   const normalizer = options.normalize || normalizeMessage;
   const isDuplicate = options.isDuplicate || (() => false);
   const clock = options.clock || Date.now;
+  let accepting = true;
+  const inFlight = new Set();
 
-  return async function onMessage(rawMessage) {
+  async function dispatch(rawMessage) {
     const normalized = normalizer(rawMessage, { receivedAt: clock() });
     const message = options.adapter.wrapIncoming(rawMessage, normalized);
 
-    if (normalized.isGroup) {
-      return options.ingress.handle(normalized, message);
-    }
+    const isAuthorizedGroup = normalized.isGroup
+      && (typeof options.ingress.accepts === 'function'
+        ? options.ingress.accepts(normalized.chatJid)
+        : true);
+    if (isAuthorizedGroup) return options.ingress.handle(normalized, message);
 
-    // Existing direct-chat behavior remains available but PM persistence is
-    // deliberately group-scoped. Its existing in-memory deduper still protects
-    // reconnect bursts; SQLite remains authoritative for the authorized group.
+    // PM persistence/authorization is scoped only to the configured group.
+    // Direct chats and every other group retain the pre-Task-5 legacy route.
     if (isDuplicate(normalized.id)) {
-      return { accepted: true, duplicate: true, source: 'memory-direct' };
+      return { accepted: true, duplicate: true, source: 'memory-legacy' };
     }
-    await options.routeLegacy(message, normalized, null);
-    return { accepted: true, duplicate: false, source: 'legacy-direct' };
+    try {
+      await options.routeLegacy(message, normalized, null);
+    } catch (error) {
+      // A failed legacy route is unfinished and must not be suppressed on a
+      // transport retry merely because its ID entered the memory fast filter.
+      if (typeof isDuplicate.forget === 'function') isDuplicate.forget(normalized.id);
+      throw error;
+    }
+    return {
+      accepted: true,
+      duplicate: false,
+      source: normalized.isGroup ? 'legacy-group' : 'legacy-direct',
+    };
+  }
+
+  function onMessage(rawMessage) {
+    if (!accepting) {
+      return Promise.resolve({ accepted: false, duplicate: false, source: 'stopping' });
+    }
+    const operation = Promise.resolve().then(() => dispatch(rawMessage));
+    inFlight.add(operation);
+    const remove = () => inFlight.delete(operation);
+    operation.then(remove, remove);
+    return operation;
+  }
+
+  onMessage.stopAccepting = () => {
+    accepting = false;
+    return inFlight.size;
   };
+  onMessage.isAccepting = () => accepting;
+  onMessage.inFlightCount = () => inFlight.size;
+  onMessage.drain = async ({ timeoutMs = DEFAULT_DRAIN_TIMEOUT_MS } = {}) => {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) {
+      throw new TypeError('drain timeoutMs must be a non-negative safe integer');
+    }
+    const pending = [...inFlight];
+    if (pending.length === 0) return { drained: true, timedOut: false, remaining: 0 };
+
+    let timer;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+      timer.unref?.();
+    });
+    const settled = Promise.allSettled(pending).then(() => 'settled');
+    const result = await Promise.race([settled, timeout]);
+    clearTimeout(timer);
+    return {
+      drained: result === 'settled',
+      timedOut: result === 'timeout',
+      remaining: inFlight.size,
+    };
+  };
+
+  return onMessage;
 }
 
-module.exports = { AuthorizedGroupIngress, createMessageEventHandler };
+module.exports = {
+  AuthorizedGroupIngress,
+  DEFAULT_DRAIN_TIMEOUT_MS,
+  DEFAULT_PROCESSING_LEASE_MS,
+  createMessageEventHandler,
+};
