@@ -41,6 +41,7 @@ function withDurations(issue, now) {
 class IssueService {
   constructor(options = {}) {
     if (!options.repositories?.issues || !options.repositories?.replyMatches
+        || !options.repositories?.attachments || !options.repositories?.messages
         || typeof options.repositories.transaction !== 'function') {
       throw new TypeError('IssueService requires Task 3 repositories');
     }
@@ -76,6 +77,20 @@ class IssueService {
       chatJid: input.chatJid,
       actorJid: input.actorJid,
     });
+  }
+
+  replayedMutation(repository, input, principal, eventType) {
+    if (!input.eventUid) return null;
+    const event = repository.findEventByUid(input.eventUid);
+    if (!event) return null;
+    const issue = repository.findById(event.issue_id, { includeDeleted: true });
+    const matches = issue
+      && event.chat_id === principal.chat.id
+      && event.actor_jid === principal.actorJid
+      && event.event_type === eventType
+      && (!input.publicId || issue.public_id === String(input.publicId).toUpperCase());
+    if (!matches) throw new Error('issue event idempotency conflict');
+    return { issue, event, replayed: true };
   }
 
   findIssue(repository, publicId, chatId, { includeDeleted = false } = {}) {
@@ -151,6 +166,8 @@ class IssueService {
     const reason = this.reason(input.reason, `Issue fields updated: ${keys.join(', ')}`);
 
     return this.repositories.transaction((tx) => {
+      const replayed = this.replayedMutation(tx.issues, input, principal, 'UPDATED');
+      if (replayed) return replayed;
       const before = this.findIssue(tx.issues, input.publicId, principal.chat.id);
       const after = tx.issues.update(before.id, patch, now);
       if (!after) throw new IssueDomainError('ISSUE_NOT_FOUND', 'Issue is unavailable');
@@ -173,6 +190,8 @@ class IssueService {
     const now = this.now();
     const reason = this.reason(input.reason ?? input.note, 'Issue verified as resolved');
     return this.repositories.transaction((tx) => {
+      const replayed = this.replayedMutation(tx.issues, input, principal, 'RESOLVED');
+      if (replayed) return replayed;
       const before = this.findIssue(tx.issues, input.publicId, principal.chat.id);
       this.assertTransition(before, ISSUE_STATUS.RESOLVED, 'resolve');
       const after = tx.issues.update(before.id, {
@@ -198,6 +217,8 @@ class IssueService {
     const now = this.now();
     const reason = this.reason(input.reason, 'Resolved issue archived');
     return this.repositories.transaction((tx) => {
+      const replayed = this.replayedMutation(tx.issues, input, principal, 'ARCHIVED');
+      if (replayed) return replayed;
       const before = this.findIssue(tx.issues, input.publicId, principal.chat.id);
       this.assertTransition(before, ISSUE_STATUS.ARCHIVED, 'archive');
       const after = tx.issues.update(before.id, {
@@ -223,6 +244,8 @@ class IssueService {
     const now = this.now();
     const reason = this.reason(input.reason, 'Issue soft-deleted by administrator');
     return this.repositories.transaction((tx) => {
+      const replayed = this.replayedMutation(tx.issues, input, principal, 'DELETED');
+      if (replayed) return replayed;
       const before = this.findIssue(tx.issues, input.publicId, principal.chat.id);
       const after = tx.issues.softDelete(before.id, now);
       const event = tx.issues.appendEvent({
@@ -243,6 +266,8 @@ class IssueService {
     const principal = this.principal(ACTIONS.RESTORE_ISSUE, input);
     const now = this.now();
     return this.repositories.transaction((tx) => {
+      const replayed = this.replayedMutation(tx.issues, input, principal, 'RESTORED');
+      if (replayed) return replayed;
       const before = this.findIssue(tx.issues, input.publicId, principal.chat.id, {
         includeDeleted: true,
       });
@@ -338,9 +363,61 @@ class IssueService {
     const now = this.now();
     const reason = this.reason(input.reason, 'Administrator corrected reply association');
     return this.repositories.transaction((tx) => {
-      const reply = tx.replyMatches.findReply(input.replyId);
+      const replayed = this.replayedMutation(
+        tx.issues,
+        { ...input, publicId: input.toPublicId },
+        principal,
+        'REPLY_MOVED'
+      );
+      if (replayed) {
+        const after = JSON.parse(replayed.event.after_json || '{}');
+        const before = JSON.parse(replayed.event.before_json || '{}');
+        const reply = tx.replyMatches.findReply(after.replyId);
+        const sourceIssue = tx.issues.findById(before.issueId, { includeDeleted: true });
+        if (!reply || !sourceIssue) throw new Error('replayed move-reply state is unavailable');
+        return {
+          reply,
+          sourceIssue,
+          targetIssue: replayed.issue,
+          event: replayed.event,
+          sourceEvent: input.sourceEventUid
+            ? tx.issues.findEventByUid(input.sourceEventUid)
+            : null,
+          replayed: true,
+        };
+      }
+      let reply;
+      if (input.replyId !== undefined && input.replyId !== null) {
+        reply = tx.replyMatches.findReply(input.replyId);
+      } else if (input.fromPublicId) {
+        const selectedSource = this.findIssue(
+          tx.issues,
+          input.fromPublicId,
+          principal.chat.id
+        );
+        const replies = tx.issues.listReplies(selectedSource.id);
+        if (replies.length !== 1) {
+          throw new IssueDomainError(
+            'REPLY_SELECTION_REQUIRED',
+            `Source issue has ${replies.length} replies; supply reply=<numeric reply id>`
+          );
+        }
+        [reply] = replies;
+      } else {
+        throw new TypeError('replyId or fromPublicId is required');
+      }
       if (!reply || reply.chat_id !== principal.chat.id) {
         throw new IssueDomainError('REPLY_NOT_FOUND', 'Confirmed reply not found in this chat');
+      }
+      if (input.fromPublicId) {
+        const expectedSource = this.findIssue(
+          tx.issues,
+          input.fromPublicId,
+          principal.chat.id
+        );
+        if (reply.current_issue_id !== expectedSource.id) {
+          throw new IssueDomainError('REPLY_NOT_FOUND', 'Reply is not linked to the supplied source issue');
+        }
       }
       const source = tx.issues.findById(reply.current_issue_id, { includeDeleted: true });
       const target = this.findIssue(tx.issues, input.toPublicId, principal.chat.id);
@@ -381,6 +458,21 @@ class IssueService {
       ));
   }
 
+  find(input) {
+    const principal = this.principal(ACTIONS.VIEW, input);
+    const now = this.now();
+    if (input.sourceWhatsappMessageId) {
+      return this.repositories.issues.findBySourceWhatsappMessageId(
+        input.sourceWhatsappMessageId,
+        principal.chat.id
+      ).map((issue) => withDurations(issue, now));
+    }
+    return this.repositories.issues.search(input.query, {
+      chatId: principal.chat.id,
+      limit: input.limit ?? 50,
+    }).map((issue) => withDurations(issue, now));
+  }
+
   show(input) {
     const includeDeleted = input.includeDeleted === true;
     const principal = this.principal(
@@ -388,14 +480,63 @@ class IssueService {
       input
     );
     const now = this.now();
-    const issue = this.findIssue(this.repositories.issues, input.publicId, principal.chat.id, {
-      includeDeleted,
-    });
+    let issue;
+    if (input.publicId) {
+      issue = this.findIssue(this.repositories.issues, input.publicId, principal.chat.id, {
+        includeDeleted,
+      });
+    } else if (input.sourceWhatsappMessageId) {
+      const matches = this.repositories.issues.findBySourceWhatsappMessageId(
+        input.sourceWhatsappMessageId,
+        principal.chat.id,
+        { includeDeleted }
+      );
+      if (matches.length === 0) {
+        throw new IssueDomainError('ISSUE_NOT_FOUND', 'No issue is linked to the quoted source');
+      }
+      if (matches.length > 1) {
+        throw new IssueDomainError(
+          'AMBIGUOUS_SOURCE',
+          'The quoted source is linked to multiple issues; use a TV number'
+        );
+      }
+      [issue] = matches;
+    } else {
+      throw new TypeError('publicId or sourceWhatsappMessageId is required');
+    }
     return {
       issue: withDurations(issue, now),
       replies: this.repositories.issues.listReplies(issue.id),
+      attachments: this.repositories.attachments.listForIssue(issue.id),
       events: this.repositories.issues.listEvents(issue.id),
+      sourceMessage: issue.source_message_id
+        ? this.repositories.messages.findById(issue.source_message_id)
+        : null,
     };
+  }
+
+  attachmentForResend(input) {
+    const principal = this.principal(ACTIONS.DOWNLOAD, input);
+    const issue = this.findIssue(
+      this.repositories.issues,
+      input.publicId,
+      principal.chat.id
+    );
+    const attachment = this.repositories.attachments.findById(input.attachmentId);
+    if (!attachment || attachment.chat_id !== principal.chat.id
+        || attachment.issue_id !== issue.id) {
+      throw new IssueDomainError(
+        'ATTACHMENT_NOT_FOUND',
+        'Attachment not found on this issue in the authorized chat'
+      );
+    }
+    if (!attachment.storage_key) {
+      throw new IssueDomainError(
+        'ATTACHMENT_UNAVAILABLE',
+        'Attachment metadata exists but no archived file is available yet'
+      );
+    }
+    return { issue, attachment };
   }
 }
 

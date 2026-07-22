@@ -7,11 +7,15 @@ const config = require('./config');
 const { getDatabase, closeDatabase } = require('./db/connection');
 const { migrateDatabase } = require('./db/migrate');
 const { createRepositories } = require('./db/repositories');
+const { IssueService } = require('./services/issue-service');
 const { PermissionService } = require('./services/permission-service');
 const { createDebouncedSmartReplyScheduler } = require('./services/debounced-smart-reply');
 const { WhatsAppAdapter } = require('./whatsapp/adapter');
 const { AuthorizedGroupIngress, createMessageEventHandler } = require('./whatsapp/ingress');
+const { createPmCommandHandlers } = require('./commands/pm-handler');
 const { createCommandRouter } = require('./commands/router');
+
+const appClock = () => Date.now();
 
 try {
   config.assertValid();
@@ -23,6 +27,7 @@ try {
 let database;
 let repositories;
 let permissionService;
+let issueService;
 try {
   database = getDatabase({
     filename: config.database.path,
@@ -43,6 +48,30 @@ try {
   permissionService = new PermissionService({
     repositories,
     authorizedChatJid: config.pm.authorizedGroupJid,
+  });
+  // Eric/admin identities are deployment configuration, not display names. Seed
+  // their durable roles idempotently so command authorization works immediately.
+  repositories.transaction((tx) => {
+    const now = appClock();
+    for (const roleInput of [
+      { jid: config.pm.ericJid, role: 'MEMBER' },
+      { jid: config.pm.ericJid, role: 'ERIC' },
+      ...config.pm.adminJids.map((jid) => ({ jid, role: 'ADMIN' })),
+    ]) {
+      if (!tx.permissions.hasRole(authorizedChat.id, roleInput.jid, roleInput.role)) {
+        tx.permissions.set({
+          chatId: authorizedChat.id,
+          canonicalJid: roleInput.jid,
+          role: roleInput.role,
+          now,
+        });
+      }
+    }
+  });
+  issueService = new IssueService({
+    repositories,
+    permissionService,
+    clock: appClock,
   });
   console.log(`🗄️ SQLite ready (schema version ${migrationResult.currentVersion})`);
 } catch (error) {
@@ -68,8 +97,8 @@ const { createMessageDeduper } = require('./message-deduper');
 history.configure({
   repositories,
   authorizedGroupJid: config.pm.authorizedGroupJid,
+  clock: appClock,
 });
-const namespacedCommandRouter = createCommandRouter({ permissionService });
 
 // Admin who approves auto-replying to new numbers. Set AUTOREPLY_ADMIN in .env
 // (full international number, e.g. 60XXXXXXXXX; a leading-0 local MY number is
@@ -91,6 +120,18 @@ const client = new Client({
   },
 });
 const whatsappAdapter = new WhatsAppAdapter({ client });
+const pmHandlers = createPmCommandHandlers({
+  issueService,
+  permissionService,
+  adapter: whatsappAdapter,
+  attachmentsDir: config.storage.attachmentsDir,
+  clock: appClock,
+});
+const namespacedCommandRouter = createCommandRouter({
+  permissionService,
+  pmHandlers,
+  clock: appClock,
+});
 
 const autoReplyTracker = new Map();
 const COOLDOWN_MS = 12 * 60 * 60 * 1000;
@@ -533,12 +574,14 @@ const authorizedGroupIngress = new AuthorizedGroupIngress({
   permissionService,
   route: routeAuthorizedMessage,
   isDuplicate: isDuplicateMessage,
+  clock: appClock,
 });
 const handleIncomingMessage = createMessageEventHandler({
   ingress: authorizedGroupIngress,
   adapter: whatsappAdapter,
   routeLegacy: routeExistingMessage,
   isDuplicate: isDuplicateMessage,
+  clock: appClock,
 });
 function onClientMessage(message) {
   handleIncomingMessage(message).catch((error) => {

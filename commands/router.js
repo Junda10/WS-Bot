@@ -1,20 +1,9 @@
 'use strict';
 
 const { parseNamespacedCommand } = require('./parser');
+const { formatPmHelp } = require('./pm-formatters');
 
-const PM_HELP = `🧭 *PM 命令帮助*
-!pm help — 查看帮助
-!pm list open — 查看未闭环工单
-!pm show TV1 — 查看工单
-!pm find <关键词> — 搜索工单
-!pm add — 引用消息建立工单
-!pm update TV1 field="内容" — 更新工单
-!pm resolve TV1 note="说明" — 标记解决
-
-Eric：!pm reply / !pm confirm-reply TV1 / !pm cancel
-管理员：!pm archive / delete / restore / move-reply
-
-参数含空格时可使用单引号或双引号；反斜线可转义字符。`;
+const PM_HELP = formatPmHelp();
 
 const SUMMARY_HELP = `🧾 *群聊摘要命令帮助*
 !summary — 总结默认时间窗
@@ -55,6 +44,10 @@ class CommandRouter {
     this.permissionService = options.permissionService;
     this.parse = options.parse || parseNamespacedCommand;
     this.parserOptions = options.parserOptions || {};
+    if (options.clock !== undefined && typeof options.clock !== 'function') {
+      throw new TypeError('CommandRouter clock must be a function');
+    }
+    this.clock = options.clock || Date.now;
     this.pmHandlers = new Map();
     this.summaryHandler = null;
 
@@ -67,7 +60,6 @@ class CommandRouter {
   registerPm(command, handler) {
     const key = String(command || '').trim().toLowerCase();
     if (!key || /\s/u.test(key)) throw new TypeError('PM handler command must be one token');
-    if (key === 'help') throw new TypeError('The PM help command is reserved');
     this.pmHandlers.set(key, requireHandler(handler, `PM ${key}`));
     return this;
   }
@@ -98,12 +90,17 @@ class CommandRouter {
       return Object.freeze({ handled: true, kind: 'parse-error', parsed });
     }
 
+    const now = this.clock();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new TypeError('CommandRouter clock must return a non-negative safe integer');
+    }
     const context = Object.freeze({
       message,
       normalized,
       persisted,
       parsed,
       chat,
+      now,
       reply: (text) => this._reply(message, text),
     });
 
@@ -112,14 +109,14 @@ class CommandRouter {
         await this._reply(message, `⚠️ 缺少 PM 子命令。\n\n${PM_HELP}`);
         return Object.freeze({ handled: true, kind: 'missing', parsed });
       }
-      if (parsed.command === 'help') {
-        await this._reply(message, PM_HELP);
-        return Object.freeze({ handled: true, kind: 'help', parsed });
-      }
       const handler = this.pmHandlers.get(parsed.command);
       if (handler) {
         const value = await handler(context);
         return Object.freeze({ handled: true, kind: 'handler', parsed, value });
+      }
+      if (parsed.command === 'help') {
+        await this._reply(message, PM_HELP);
+        return Object.freeze({ handled: true, kind: 'help', parsed });
       }
       await this._reply(
         message,

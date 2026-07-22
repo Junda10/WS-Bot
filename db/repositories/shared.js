@@ -77,12 +77,20 @@ function normalizeSearchQuery(text) {
   const trimmed = text.trim();
   if (!trimmed) throw new TypeError('query must contain a searchable term');
   const terms = trimmed.split(/\s+/u).filter(Boolean);
+  const escapeLike = (term) => `%${term
+    .replaceAll('\\', '\\\\')
+    .replaceAll('%', '\\%')
+    .replaceAll('_', '\\_')}%`;
   return {
     text: trimmed,
+    terms,
     fts: terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' AND '),
     // FTS5 trigram does not index terms shorter than three Unicode code points.
     useFts: terms.every((term) => Array.from(term).length >= 3),
-    like: `%${trimmed.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')}%`,
+    // Keep the whole-query value for compatibility and provide per-term LIKE
+    // values so short CJK terms can match non-adjacent text deterministically.
+    like: escapeLike(trimmed),
+    likes: terms.map(escapeLike),
   };
 }
 

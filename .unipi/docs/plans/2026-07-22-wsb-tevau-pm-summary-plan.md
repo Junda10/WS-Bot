@@ -112,7 +112,7 @@ specs:
     3. 从 `index.js` 抽出 PM/summary 路由入口，保留旧逻辑适配层。
     4. 添加 parser、路由优先级和旧行为 smoke tests。
 
-- unstarted: Task 7 — 实现 PM 查询和非 AI 修改指令
+- completed: Task 7 — 实现 PM 查询和非 AI 修改指令
   - Description: 完成 help/list/show/find/update/resolve/archive/delete/restore/move-reply 的业务处理、格式化和附件重发入口。
   - Dependencies: Tasks 4, 6
   - Acceptance Criteria:

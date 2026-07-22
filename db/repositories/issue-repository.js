@@ -31,6 +31,7 @@ class IssueRepository {
     this.byIdempotencyKey = db.prepare('SELECT * FROM issues WHERE idempotency_key = ?');
     this.byPublicId = db.prepare('SELECT * FROM issues WHERE public_id = ?');
     this.byId = db.prepare('SELECT * FROM issues WHERE id = ?');
+    this.eventByUid = db.prepare('SELECT * FROM issue_events WHERE event_uid = ?');
     this.messageById = db.prepare('SELECT id, chat_id, whatsapp_message_id FROM messages WHERE id = ?');
   }
 
@@ -215,11 +216,47 @@ class IssueRepository {
 
   listOpen(chatId) {
     return this.db.prepare(`
-      SELECT * FROM issues
-      WHERE chat_id = ? AND deleted_at IS NULL
-        AND status IN ('WAITING_TEVAU', 'REPLIED')
-      ORDER BY id
+      SELECT i.*,
+        (SELECT count(*) FROM attachments a
+         WHERE a.issue_id = i.id AND a.deleted_at IS NULL) AS attachment_count
+      FROM issues i
+      WHERE i.chat_id = ? AND i.deleted_at IS NULL
+        AND i.status IN ('WAITING_TEVAU', 'REPLIED')
+      ORDER BY i.id
     `).all(requireInteger(chatId, 'chatId', { min: 1 }));
+  }
+
+  findBySourceWhatsappMessageId(sourceWhatsappMessageId, chatId, {
+    includeDeleted = false,
+  } = {}) {
+    const sourceId = requireString(
+      sourceWhatsappMessageId,
+      'sourceWhatsappMessageId',
+      { max: 500 }
+    );
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    return this.db.prepare(`
+      SELECT DISTINCT i.*
+      FROM issues i
+      WHERE i.chat_id = @chatId
+        ${includeDeleted ? '' : 'AND i.deleted_at IS NULL'}
+        AND (
+          i.source_whatsapp_message_id = @sourceId
+          OR EXISTS (
+            SELECT 1 FROM issue_events e
+            WHERE e.issue_id = i.id AND e.source_whatsapp_message_id = @sourceId
+          )
+          OR EXISTS (
+            SELECT 1 FROM issue_replies r
+            WHERE r.current_issue_id = i.id AND r.source_whatsapp_message_id = @sourceId
+          )
+        )
+      ORDER BY i.id
+    `).all({ chatId: id, sourceId });
+  }
+
+  findEventByUid(eventUid) {
+    return this.eventByUid.get(requireString(eventUid, 'eventUid', { max: 200 })) || null;
   }
 
   listEvents(issueId) {
@@ -381,21 +418,25 @@ class IssueRepository {
     const search = normalizeSearchQuery(query);
     const id = chatId == null ? null : requireInteger(chatId, 'chatId', { min: 1 });
     const chatFilter = chatId == null ? '' : 'AND i.chat_id = @chatId';
-    const likePredicate = `(
-      i.title LIKE @like ESCAPE '\\' COLLATE NOCASE
-      OR i.description LIKE @like ESCAPE '\\' COLLATE NOCASE
-      OR EXISTS (
-        SELECT 1 FROM issue_replies r
-        WHERE r.current_issue_id = i.id
-          AND r.reply_text LIKE @like ESCAPE '\\' COLLATE NOCASE
-      )
-    )`;
+    const parameters = { chatId: id, limit: maximum };
+    const likePredicate = search.likes.map((like, index) => {
+      parameters[`like${index}`] = like;
+      return `(
+        i.title LIKE @like${index} ESCAPE '\\' COLLATE NOCASE
+        OR i.description LIKE @like${index} ESCAPE '\\' COLLATE NOCASE
+        OR EXISTS (
+          SELECT 1 FROM issue_replies r
+          WHERE r.current_issue_id = i.id
+            AND r.reply_text LIKE @like${index} ESCAPE '\\' COLLATE NOCASE
+        )
+      )`;
+    }).join(' AND ');
     if (!search.useFts) {
       return this.db.prepare(`
         SELECT i.*, 0.0 AS rank FROM issues i
         WHERE i.deleted_at IS NULL ${chatFilter} AND ${likePredicate}
         ORDER BY i.id LIMIT @limit
-      `).all({ like: search.like, chatId: id, limit: maximum });
+      `).all(parameters);
     }
     return this.db.prepare(`
       WITH fts_matches AS (
@@ -406,7 +447,7 @@ class IssueRepository {
       WHERE i.deleted_at IS NULL ${chatFilter}
         AND (EXISTS (SELECT 1 FROM fts_matches WHERE rowid = i.id) OR ${likePredicate})
       ORDER BY rank, i.id LIMIT @limit
-    `).all({ fts: search.fts, like: search.like, chatId: id, limit: maximum });
+    `).all({ ...parameters, fts: search.fts });
   }
 }
 
