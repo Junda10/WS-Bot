@@ -9,6 +9,8 @@ const { migrateDatabase } = require('./db/migrate');
 const { createRepositories } = require('./db/repositories');
 const { IssueService } = require('./services/issue-service');
 const { PermissionService } = require('./services/permission-service');
+const { PmAiService } = require('./services/pm-ai-service');
+const { PmAddService } = require('./services/pm-add-service');
 const { createDebouncedSmartReplyScheduler } = require('./services/debounced-smart-reply');
 const { AttachmentStorage } = require('./services/attachment-storage');
 const { AttachmentProcessingQueue } = require('./services/attachment-processing-queue');
@@ -159,10 +161,20 @@ const attachmentService = new AttachmentService({
   temporaryRetentionDays: config.retention.messageDays,
   clock: appClock,
 });
+const pmAiService = new PmAiService({ aiClient: require('./ai') });
+const pmAddService = new PmAddService({
+  repositories,
+  permissionService,
+  issueService,
+  attachmentService,
+  aiService: pmAiService,
+  attachmentWaitMs: config.storage.processingTimeoutMs + 5000,
+});
 const pmHandlers = createPmCommandHandlers({
   issueService,
   permissionService,
   attachmentService,
+  pmAddService,
   adapter: whatsappAdapter,
   attachmentsDir: config.storage.attachmentsDir,
   clock: appClock,

@@ -145,6 +145,13 @@ class AttachmentRepository {
     return { record: existing, created: false };
   }
 
+  findByIdempotencyKey(idempotencyKey, { includeDeleted = false } = {}) {
+    const row = hydrateBlob(this.byIdempotencyKey.get(
+      requireString(idempotencyKey, 'idempotencyKey', { max: 500 })
+    ) || null);
+    return includeDeleted || !row || row.deleted_at === null ? row : null;
+  }
+
   findById(id, { includeDeleted = false } = {}) {
     const row = hydrateBlob(this.db.prepare(`
       SELECT a.*, b.storage_key AS blob_storage_key
@@ -803,6 +810,32 @@ class AttachmentRepository {
       WHERE promotion_target_key IS NOT NULL
       ORDER BY promotion_started_at, sha256
     `).all();
+  }
+
+  listIssueLinkedTemporaryBlobs(issueId = null) {
+    const selectedIssueId = issueId == null
+      ? null
+      : requireInteger(issueId, 'issueId', { min: 1 });
+    // Choose one live issue attachment deterministically for each shared blob.
+    // Crucially, this query does not depend on promotion_target_key: a process
+    // may die after the issue link commits but before an intent is recorded.
+    return this.db.prepare(`
+      SELECT b.*, a.id AS attachment_id, a.issue_id AS linked_issue_id,
+             a.chat_id AS linked_chat_id
+      FROM attachment_blobs b
+      JOIN attachments a ON a.id = (
+        SELECT candidate.id
+        FROM attachments candidate
+        WHERE candidate.blob_sha256 = b.sha256
+          AND candidate.issue_id IS NOT NULL
+          AND candidate.deleted_at IS NULL
+          AND (@issueId IS NULL OR candidate.issue_id = @issueId)
+        ORDER BY candidate.issue_id, candidate.id
+        LIMIT 1
+      )
+      WHERE replace(b.storage_key, char(92), '/') LIKE 'temporary/%'
+      ORDER BY COALESCE(b.promotion_started_at, b.created_at), b.sha256
+    `).all({ issueId: selectedIssueId });
   }
 
   updateBlobStorage(input) {

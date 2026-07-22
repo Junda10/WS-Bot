@@ -33,6 +33,9 @@ class IssueRepository {
     this.byId = db.prepare('SELECT * FROM issues WHERE id = ?');
     this.eventByUid = db.prepare('SELECT * FROM issue_events WHERE event_uid = ?');
     this.messageById = db.prepare('SELECT id, chat_id, whatsapp_message_id FROM messages WHERE id = ?');
+    this.sourceSnapshotByIssue = db.prepare(
+      'SELECT * FROM issue_source_snapshots WHERE issue_id = ?'
+    );
   }
 
   allocateSequence(now) {
@@ -88,7 +91,11 @@ class IssueRepository {
           assertIdempotent(existing, {
             chat_id: values.chatId, title: values.title, description: values.description,
           }, ['chat_id', 'title', 'description'], 'issue');
-          return { record: existing, created: false };
+          return {
+            record: existing,
+            created: false,
+            sourceSnapshot: this.sourceSnapshotByIssue.get(existing.id) || null,
+          };
         }
       }
 
@@ -131,7 +138,100 @@ class IssueRepository {
         occurredAt: values.now,
         createdAt: values.now,
       });
-      return { record: issue, created: true };
+
+      let sourceSnapshot = null;
+      if (input.sourceSnapshot) {
+        const snapshot = input.sourceSnapshot;
+        const commandMessageId = requireInteger(
+          snapshot.commandMessageId,
+          'sourceSnapshot.commandMessageId',
+          { min: 1 }
+        );
+        const command = this.messageById.get(commandMessageId);
+        if (!command || command.chat_id !== values.chatId) {
+          throw new Error('Source snapshot command message is unavailable or cross-chat');
+        }
+        const snapshotSourceId = snapshot.sourceMessageId == null
+          ? null
+          : requireInteger(snapshot.sourceMessageId, 'sourceSnapshot.sourceMessageId', { min: 1 });
+        if (snapshotSourceId !== values.sourceMessageId) {
+          throw new Error('Source snapshot message does not match issue source');
+        }
+        const uncertainties = Array.isArray(snapshot.uncertainties)
+          ? snapshot.uncertainties.map((entry) => String(entry).slice(0, 1000))
+          : [];
+        sourceSnapshot = this.db.prepare(`
+          INSERT INTO issue_source_snapshots (
+            issue_id, chat_id, command_message_id, command_whatsapp_message_id,
+            source_message_id, source_whatsapp_message_id, source_body,
+            source_sender_jid, source_sent_at, source_media_json,
+            extraction_status, ai_model, ai_attempts, ai_error_code,
+            ai_error_message, uncertainties_json, source_summary, created_at
+          ) VALUES (
+            @issueId, @chatId, @commandMessageId, @commandWhatsappMessageId,
+            @sourceMessageId, @sourceWhatsappMessageId, @sourceBody,
+            @sourceSenderJid, @sourceSentAt, @sourceMediaJson,
+            @extractionStatus, @aiModel, @aiAttempts, @aiErrorCode,
+            @aiErrorMessage, @uncertaintiesJson, @sourceSummary, @createdAt
+          ) RETURNING *
+        `).get({
+          issueId: issue.id,
+          chatId: values.chatId,
+          commandMessageId,
+          commandWhatsappMessageId: requireString(
+            snapshot.commandWhatsappMessageId,
+            'sourceSnapshot.commandWhatsappMessageId',
+            { max: 500 }
+          ),
+          sourceMessageId: values.sourceMessageId,
+          sourceWhatsappMessageId: requireString(
+            snapshot.sourceWhatsappMessageId,
+            'sourceSnapshot.sourceWhatsappMessageId',
+            { max: 500 }
+          ),
+          sourceBody: snapshot.sourceBody == null ? null : String(snapshot.sourceBody).slice(0, 1000000),
+          sourceSenderJid: optionalString(snapshot.sourceSenderJid, 'sourceSnapshot.sourceSenderJid', { max: 200 }),
+          sourceSentAt: snapshot.sourceSentAt == null
+            ? null : requireTimestamp(snapshot.sourceSentAt, 'sourceSnapshot.sourceSentAt'),
+          sourceMediaJson: snapshot.sourceMedia == null ? null : JSON.stringify(snapshot.sourceMedia),
+          extractionStatus: enumValue(
+            snapshot.extractionStatus,
+            'sourceSnapshot.extractionStatus',
+            new Set(['AI_VALID', 'FALLBACK'])
+          ),
+          aiModel: optionalString(snapshot.aiModel, 'sourceSnapshot.aiModel', { max: 300 }),
+          aiAttempts: requireInteger(snapshot.aiAttempts ?? 0, 'sourceSnapshot.aiAttempts'),
+          aiErrorCode: optionalString(snapshot.aiErrorCode, 'sourceSnapshot.aiErrorCode', { max: 100 }),
+          aiErrorMessage: snapshot.aiErrorMessage == null
+            ? null : String(snapshot.aiErrorMessage).slice(0, 2000),
+          uncertaintiesJson: JSON.stringify(uncertainties),
+          sourceSummary: snapshot.sourceSummary == null
+            ? null : String(snapshot.sourceSummary).slice(0, 10000),
+          createdAt: values.now,
+        });
+      }
+
+      const attachmentIds = [...new Set(input.attachmentIds || [])];
+      if (attachmentIds.length > 10) throw new RangeError('At most 10 source attachments may be linked');
+      for (const rawAttachmentId of attachmentIds) {
+        const attachmentId = requireInteger(rawAttachmentId, 'attachmentId', { min: 1 });
+        const linked = this.db.prepare(`
+          UPDATE attachments
+          SET issue_id = @issueId, issue_chat_id = @chatId,
+              retention_class = 'ISSUE', updated_at = @now
+          WHERE id = @attachmentId AND chat_id = @chatId AND deleted_at IS NULL
+            AND (issue_id IS NULL OR issue_id = @issueId)
+          RETURNING blob_sha256
+        `).get({ attachmentId, issueId: issue.id, chatId: values.chatId, now: values.now });
+        if (!linked) throw new Error('Source attachment is unavailable, cross-chat, or already linked');
+        if (linked.blob_sha256) {
+          this.db.prepare(`
+            UPDATE attachment_blobs SET retention_class = 'ISSUE', updated_at = @now
+            WHERE sha256 = @sha256
+          `).run({ sha256: linked.blob_sha256, now: values.now });
+        }
+      }
+      return { record: issue, created: true, sourceSnapshot, attachmentIds };
     });
   }
 
@@ -200,6 +300,19 @@ class IssueRepository {
       throw new Error('Confirmed replies must use replyMatches.confirm() atomically');
     }
     return immediate(this.db, () => this.insertEvent(input));
+  }
+
+  findByIdempotencyKey(idempotencyKey, { includeDeleted = true } = {}) {
+    const row = this.byIdempotencyKey.get(
+      requireString(idempotencyKey, 'idempotencyKey', { max: 500 })
+    ) || null;
+    return includeDeleted || !row || row.deleted_at === null ? row : null;
+  }
+
+  findSourceSnapshot(issueId) {
+    return this.sourceSnapshotByIssue.get(
+      requireInteger(issueId, 'issueId', { min: 1 })
+    ) || null;
   }
 
   findByPublicId(publicId, { includeDeleted = false } = {}) {

@@ -241,10 +241,10 @@ class AttachmentService {
 
   captureQuoted(input) {
     const principal = this.permissions.authorize(ACTIONS.DOWNLOAD, {
-      chatJid: input.normalized?.chatJid,
-      actorJid: input.normalized?.senderJid,
+      chatJid: input.normalized?.chatJid || input.source?.chatJid,
+      actorJid: input.normalized?.senderJid || input.actorJid,
     });
-    const quoted = input.normalized?.quoted;
+    const quoted = input.source || input.normalized?.quoted;
     if (!quoted?.id || quoted.chatJid !== principal.chat.jid || !quoted.media) {
       throw new AttachmentProcessingError(
         'QUOTED_MEDIA_UNAVAILABLE',
@@ -252,36 +252,93 @@ class AttachmentService {
         { retryable: false }
       );
     }
-    const commandMessageId = input.persisted?.id;
-    if (!Number.isSafeInteger(commandMessageId)) {
+    const commandMessageId = input.commandMessageId || input.persisted?.id;
+    const commandWhatsappMessageId = input.commandWhatsappMessageId || input.normalized?.id;
+    if (!Number.isSafeInteger(commandMessageId) || !commandWhatsappMessageId) {
       throw new TypeError('Persisted command message is required for quoted attachment capture');
     }
     const metadata = quoted.media;
     const result = this.repositories.attachments.create({
-      idempotencyKey: `${input.normalized.id}:quoted-media:${quoted.id}`,
+      idempotencyKey: input.idempotencyKey
+        || `${principal.chat.id}:${principal.chat.jid}:${commandWhatsappMessageId}:quoted-media:${quoted.id}`,
       messageId: commandMessageId,
       issueId: input.issueId,
       sourceWhatsappMessageId: quoted.id,
       sourceSenderJid: quoted.senderJid ?? null,
       sourceSentAt: quoted.sentAt ?? null,
       mediaWhatsappMessageId: quoted.id,
-      displayName: sanitizeDisplayName(metadata.fileName),
+      displayName: sanitizeDisplayName(
+        metadata.fileName || `quoted-${metadata.type || 'document'}-${quoted.id}`
+      ),
       declaredMime: metadata.mimeType,
       sizeBytes: metadata.sizeBytes ?? 0,
       retentionClass: input.issueId ? 'ISSUE' : 'TEMPORARY',
       processingStatus: 'PENDING',
       now: this.now(),
     });
-    const operation = this.enqueue(
-      result.record.id,
-      (signal) => this.adapter.downloadQuotedAttachment(input.message, this._downloadOptions(result.record, {
+
+    const active = this.enqueued.get(result.record.id);
+    if (active) {
+      return { attachment: result.record, created: result.created, operation: active.operation };
+    }
+    const current = this.repositories.attachments.findById(result.record.id);
+    const terminal = current.processing_status === 'READY'
+      || (current.processing_status === 'UNPARSED' && current.retryable === 0);
+    if (terminal) {
+      return { attachment: current, created: result.created, operation: Promise.resolve({ attachment: current }) };
+    }
+
+    const downloader = async (signal) => {
+      const options = this._downloadOptions(current, {
         signal,
         expectedMessageId: quoted.id,
         expectedChatJid: principal.chat.jid,
-      })),
-      { source: 'quoted' }
-    );
-    return { attachment: result.record, created: result.created, operation };
+      });
+      if (input.message && typeof this.adapter.downloadQuotedAttachment === 'function') {
+        try {
+          return await this.adapter.downloadQuotedAttachment(input.message, options);
+        } catch (error) {
+          const mayRecoverByPersistentId = [
+            'QUOTED_MEDIA_UNAVAILABLE', 'MEDIA_EXPIRED', 'MEDIA_LOOKUP_UNAVAILABLE',
+          ].includes(error?.code);
+          if (!mayRecoverByPersistentId
+              || typeof this.adapter.downloadAttachmentByMessageId !== 'function') throw error;
+        }
+      }
+      return this.adapter.downloadAttachmentByMessageId(quoted.id, options);
+    };
+    const admission = this._admit(current.id, downloader, { source: 'quoted' });
+    return { attachment: current, created: result.created, operation: admission.operation };
+  }
+
+  async repairIssuePromotions(input) {
+    // Reuse the issue service's authorized, same-chat lookup before inspecting
+    // any attachment/blob rows. Members allowed to retry files are also the
+    // principals allowed to repair their durable issue evidence.
+    const selected = this.issues.attachmentsForRetry({ ...input, now: this.now() });
+    const repairedAttachmentIds = [];
+    const promotionErrors = [];
+    for (const candidate of this.repositories.attachments.listIssueLinkedTemporaryBlobs(
+      selected.issue.id
+    )) {
+      try {
+        await this._promoteBlobForAttachment({
+          attachmentId: candidate.attachment_id,
+          issueId: candidate.linked_issue_id,
+          blob: candidate,
+        });
+        repairedAttachmentIds.push(candidate.attachment_id);
+      } catch (error) {
+        promotionErrors.push({
+          attachmentId: candidate.attachment_id,
+          issueId: candidate.linked_issue_id,
+          sha256: candidate.sha256,
+          ...errorDetails(error),
+        });
+      }
+    }
+    if (promotionErrors.length > 0) this._scheduleRecoveryAt(this.now() + 5000);
+    return { issue: selected.issue, repairedAttachmentIds, promotionErrors };
   }
 
   retryIssue(input) {
@@ -446,6 +503,11 @@ class AttachmentService {
         }, this.limits, { signal });
         throwIfAborted(signal);
         const displayName = inferredDisplayName(sourceDisplayName, preflight.detected);
+        // The PM add flow may link this durable row while a bounded caller is
+        // waiting. Re-observe ownership before choosing permanent vs temporary
+        // storage so that late completion can never strand issue evidence in a
+        // temporary archive.
+        attachment = this.repositories.attachments.findById(attachmentId);
         committed = await this.storage.commitStaged(stage, {
           issueId: attachment.issue_id,
           extension: preflight.detected.extension,
@@ -475,10 +537,11 @@ class AttachmentService {
         archiveFinalized = true;
         duplicateOrphanStorageKey = finalized.orphanStorageKey;
         attempt = null;
-        if (attachment.issue_id && /^temporary[\\/]/u.test(finalized.blob.storage_key)) {
+        const linkedAttachment = this.repositories.attachments.findById(attachmentId);
+        if (linkedAttachment.issue_id && /^temporary[\\/]/u.test(finalized.blob.storage_key)) {
           await this._promoteBlobForAttachment({
             attachmentId,
-            issueId: attachment.issue_id,
+            issueId: linkedAttachment.issue_id,
             blob: finalized.blob,
           });
           finalized.blob = this.repositories.attachments.findBlob(preflight.sha256);
@@ -605,21 +668,49 @@ class AttachmentService {
 
   async _recoverPending() {
     const promotionErrors = [];
-    const pendingHashes = new Set();
+    const attemptedPromotionHashes = new Set();
+    const failedPromotionHashes = new Set();
     for (const blob of this.repositories.attachments.listPendingBlobPromotions()) {
+      attemptedPromotionHashes.add(blob.sha256);
       try {
         await this._reconcilePromotion(blob);
       } catch (error) {
-        pendingHashes.add(blob.sha256);
+        failedPromotionHashes.add(blob.sha256);
         const details = { sha256: blob.sha256, ...errorDetails(error) };
         promotionErrors.push(details);
         this.logger.error?.(`Attachment promotion recovery failed for ${blob.sha256}: ${details.message}`);
       }
     }
+    // Close the pre-intent crash window: issue creation/linking is one DB
+    // transaction, but the subsequent promotion intent is necessarily separate
+    // from filesystem work. Recover every linked blob whose canonical path is
+    // still temporary, even when promotion_target_key was never written.
+    for (const candidate of this.repositories.attachments.listIssueLinkedTemporaryBlobs()) {
+      if (attemptedPromotionHashes.has(candidate.sha256)) continue;
+      attemptedPromotionHashes.add(candidate.sha256);
+      try {
+        await this._promoteBlobForAttachment({
+          attachmentId: candidate.attachment_id,
+          issueId: candidate.linked_issue_id,
+          blob: candidate,
+        });
+      } catch (error) {
+        failedPromotionHashes.add(candidate.sha256);
+        const details = {
+          sha256: candidate.sha256,
+          attachmentId: candidate.attachment_id,
+          issueId: candidate.linked_issue_id,
+          ...errorDetails(error),
+        };
+        promotionErrors.push(details);
+        this.logger.error?.(`Attachment pre-intent promotion recovery failed for ${candidate.sha256}: ${details.message}`);
+      }
+    }
+    if (promotionErrors.length > 0) this._scheduleRecoveryAt(this.now() + 5000);
 
     const missing = [];
     for (const blob of this.repositories.attachments.listBlobs()) {
-      if (pendingHashes.has(blob.sha256)) continue;
+      if (failedPromotionHashes.has(blob.sha256)) continue;
       try { this.storage.resolve(blob.storage_key); } catch (error) {
         this.logger.error?.(`Attachment blob ${blob.sha256} is missing or unsafe: ${error.message}`);
         missing.push(this.repositories.attachments.reconcileMissingBlob(blob.sha256, this.now()));
@@ -774,11 +865,18 @@ class AttachmentService {
         retryable: false,
       });
     }
-    return this._promoteBlobForAttachment({
-      attachmentId: attachment.id,
-      issueId: issue.id,
-      blob: this.repositories.attachments.findBlob(attachment.blob_sha256),
-    });
+    try {
+      return await this._promoteBlobForAttachment({
+        attachmentId: attachment.id,
+        issueId: issue.id,
+        blob: this.repositories.attachments.findBlob(attachment.blob_sha256),
+      });
+    } catch (error) {
+      // Promotion failures are durable repair work, including failures before
+      // beginBlobPromotion could persist an intent.
+      this._scheduleRecoveryAt(this.now() + 5000);
+      throw error;
+    }
   }
 }
 

@@ -63,6 +63,7 @@ function formatDisplayBlock(value, options = {}) {
 function formatPmHelp(topic = '') {
   const selected = String(topic || '').trim().toLowerCase();
   const member = `🧭 *PM 命令帮助｜群成员*
+!pm add — 引用来源消息或文档后直接建立 WAITING_TEVAU 工单
 !pm list open — 查看全部未闭环工单（最久优先）
 !pm show TV1 — 查看完整工单；也可引用来源消息后发送 !pm show
 !pm find <关键词> — 搜索标题、问题和已确认回复
@@ -241,6 +242,55 @@ function formatIssueDetail(detail) {
   return lines.join('\n').trimEnd();
 }
 
+function safeMachineCode(value, fallback) {
+  const code = String(value || '');
+  return /^[A-Z][A-Z0-9_:-]{0,99}$/u.test(code)
+    ? code
+    : safeDisplayLine(code, { fallback });
+}
+
+function formatAddAttachmentStatus(attachment) {
+  const name = safeDisplayLine(attachment.displayName, { fallback: `附件 #${attachment.id}` });
+  const parse = safeMachineCode(attachment.parseStatus, 'PENDING');
+  const processing = safeMachineCode(attachment.processingStatus, 'PENDING');
+  const promotion = safeMachineCode(attachment.promotion, 'NOT_ARCHIVED');
+  const error = attachment.errorCode
+    ? `｜失败=${safeMachineCode(attachment.errorCode, 'PROCESSING_FAILED')}${attachment.retryable ? '（可重试）' : '（不可重试）'}`
+    : '';
+  return `- ${name}：处理=${processing}｜解析=${parse}｜归档=${promotion}${error}`;
+}
+
+function formatAddSuccess(result) {
+  const issue = result.issue;
+  const attachments = Array.isArray(result.attachments) ? result.attachments : [];
+  const uncertainties = Array.isArray(result.uncertainties) ? result.uncertainties : [];
+  const lines = [
+    `✅ *已建立 ${safeDisplayLine(issue.public_id)}｜${safeDisplayLine(issue.title, { fallback: '资料待补充' })}*${result.replayed ? '（幂等重放）' : ''}`,
+    `状态：${STATUS_LABELS[issue.status] ? issue.status : safeDisplayLine(issue.status)}（${statusLabel(issue.status)}）`,
+    `记录时间：${formatTimestamp(issue.created_at)}`,
+    '',
+    '*提取的问题描述*',
+    formatDisplayBlock(issue.description, { fallback: '资料待补充' }),
+    '',
+    `*附件状态（${attachments.length}）*`,
+    ...(attachments.length > 0 ? attachments.map(formatAddAttachmentStatus) : ['- 无附件']),
+    '',
+    '*不确定项*',
+    ...(uncertainties.length > 0
+      ? uncertainties.map((entry) => `- ${safeDisplayLine(entry, { fallback: '未说明' })}`)
+      : ['- 无明确不确定项']),
+  ];
+  if (attachments.some((attachment) => attachment.promotion === 'RECOVERABLE_PARTIAL')) {
+    lines.push('', '⚠️ 工单已建立，但附件永久归档处于可恢复部分状态；再次发送同一命令或使用 !pm retry-file 可重试，不会新建工单。');
+  }
+  lines.push(
+    '',
+    '若提取内容不准确，请修正：',
+    `!pm update ${safeDisplayLine(issue.public_id)} description="..."`
+  );
+  return lines.join('\n');
+}
+
 function formatMutationSuccess(operation, result) {
   const issue = result.issue || result.targetIssue || result.record || result;
   const labels = {
@@ -311,6 +361,7 @@ module.exports = {
   EVENT_LABELS,
   STATUS_LABELS,
   formatActor,
+  formatAddSuccess,
   formatDisplayBlock,
   formatDuration,
   formatIssueDetail,

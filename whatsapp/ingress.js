@@ -42,9 +42,13 @@ class AuthorizedGroupIngress {
   persist(normalized, chat) {
     return this.repositories.transaction(() => {
       let quotedMessageId = null;
+      let quotedRecord = null;
       if (normalized.quoted?.id) {
         const quoted = this.repositories.messages.findByWhatsappId(normalized.quoted.id);
-        if (quoted?.chat_id === chat.id) quotedMessageId = quoted.id;
+        if (quoted?.chat_id === chat.id) {
+          quotedMessageId = quoted.id;
+          quotedRecord = quoted;
+        }
       }
 
       const messageResult = this.repositories.messages.create({
@@ -56,9 +60,9 @@ class AuthorizedGroupIngress {
         body: normalized.body,
         quotedMessageId,
         quotedWhatsappMessageId: normalized.quoted?.id || null,
-        quotedBody: normalized.quoted?.body ?? null,
-        quotedSenderJid: normalized.quoted?.senderJid || null,
-        quotedSentAt: normalized.quoted?.sentAt ?? null,
+        quotedBody: quotedRecord?.body ?? normalized.quoted?.body ?? null,
+        quotedSenderJid: quotedRecord?.sender_jid || normalized.quoted?.senderJid || null,
+        quotedSentAt: quotedRecord?.sent_at ?? normalized.quoted?.sentAt ?? null,
         quotedMedia: normalized.quoted?.media ?? null,
         sentAt: normalized.sentAt,
         receivedAt: normalized.receivedAt,

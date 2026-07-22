@@ -5,7 +5,9 @@ const fs = require('fs');
 const path = require('path');
 const { AuthorizationError } = require('../services/permission-service');
 const { IssueDomainError } = require('../services/issue-service');
+const { PmAddError } = require('../services/pm-add-service');
 const {
+  formatAddSuccess,
   formatIssueDetail,
   formatMutationSuccess,
   formatOpenList,
@@ -158,6 +160,7 @@ function resolveArchivedAttachmentPath(storageKey, attachmentsDir) {
 
 function knownErrorMessage(error) {
   if (error instanceof CommandInputError) return `⚠️ 命令参数错误：${error.message}`;
+  if (error instanceof PmAddError) return `❌ 建单未完成：${error.message}`;
   if (error instanceof AuthorizationError) {
     if (error.code === 'ROLE_REQUIRED') return `⛔ 无权限：${error.message}`;
     return `⛔ 此处不能执行 PM 命令：${error.message}`;
@@ -194,6 +197,7 @@ function createPmCommandHandlers(options = {}) {
   const maxOutputLength = options.maxOutputLength;
   const attachmentsDir = options.attachmentsDir;
   const attachmentService = options.attachmentService || null;
+  const pmAddService = options.pmAddService || null;
 
   if (!issueService || typeof issueService.show !== 'function') {
     throw new TypeError('PM handlers require IssueService');
@@ -243,6 +247,21 @@ function createPmCommandHandlers(options = {}) {
   }
 
   const handlers = {
+    add: wrap(async (context) => {
+      // Explicitly gate before argument/source inspection. PmAddService repeats
+      // this check as a defense-in-depth boundary before every side effect.
+      const identity = actorContext(context);
+      permissionService.authorize('CREATE_ISSUE', identity);
+      if (!pmAddService || typeof pmAddService.add !== 'function') {
+        throw new PmAddError('ADD_UNAVAILABLE', '直接建单服务尚未配置');
+      }
+      if (context.parsed.args.length > 0) {
+        throw new CommandInputError('TOO_MANY_ARGUMENTS', '!pm add 不接受额外参数');
+      }
+      const result = await pmAddService.add(context);
+      return { text: formatAddSuccess(result), value: result };
+    }),
+
     help: wrap(async (context) => {
       const identity = base(context);
       permissionService.authorize('VIEW', identity);

@@ -78,7 +78,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   const { db } = fixture(t);
   const expectedTables = [
     'attachment_processing_attempts', 'attachments', 'chats', 'issue_events',
-    'issue_replies', 'issues', 'jid_aliases', 'messages', 'permission_roles',
+    'issue_replies', 'issue_source_snapshots', 'issues', 'jid_aliases', 'messages', 'permission_roles',
     'permissions', 'reply_match_candidates', 'reply_match_sessions', 'sequences',
     'summary_run_parts', 'summary_runs',
   ];
@@ -89,7 +89,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   `).all().map((row) => row.name);
   for (const table of expectedTables) assert.ok(tables.includes(table), `${table} should exist`);
   assert.ok(tables.includes('issue_fts'));
-  assert.equal(db.pragma('user_version', { simple: true }), 7);
+  assert.equal(db.pragma('user_version', { simple: true }), 8);
   assert.deepEqual(db.pragma('foreign_key_check'), []);
   assert.deepEqual(
     db.prepare("SELECT name, next_value, updated_at FROM sequences WHERE name='issue_tv'").get(),
@@ -99,6 +99,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
     'issue_replies_fts_insert', 'issue_replies_fts_move',
     'issue_events_append_only_update', 'summary_parts_insert_guard',
     'messages_processing_state_update_guard', 'messages_quoted_evidence_immutable',
+    'issue_source_snapshots_immutable_update',
   ]) {
     assert.ok(db.prepare(
       "SELECT 1 FROM sqlite_schema WHERE type='trigger' AND name=?"

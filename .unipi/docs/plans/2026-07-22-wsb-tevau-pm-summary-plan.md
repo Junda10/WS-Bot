@@ -184,7 +184,7 @@ specs:
     3. 先用 FTS/元数据缩小 open issues，再把紧凑候选交给 AI。
     4. 使用 mock/nock 测试有效、畸形、缺字段、超时和对抗响应。
 
-- unstarted: Task 12 — 完成 `!pm add` 直接建单流程
+- completed: Task 12 — 完成 `!pm add` 直接建单流程
   - Description: 解析被引用消息及附件，调用 AI，事务化创建 `TVn` 和审计事件，并在信息不足时安全降级。
   - Dependencies: Tasks 4, 6, 8, 11
   - Acceptance Criteria:

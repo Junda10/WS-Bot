@@ -142,6 +142,8 @@ class IssueService {
       ownerJid,
       sourceMessageId: input.sourceMessageId,
       sourceWhatsappMessageId: input.sourceWhatsappMessageId,
+      sourceSnapshot: input.sourceSnapshot,
+      attachmentIds: input.attachmentIds,
       reason,
       now,
     }));
