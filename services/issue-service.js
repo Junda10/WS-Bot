@@ -330,7 +330,11 @@ class IssueService {
     if (!issue || issue.chat_id !== principal.chat.id || issue.deleted_at !== null) {
       throw new IssueDomainError('ISSUE_NOT_FOUND', 'Issue not found in the authorized chat');
     }
-    if (![ISSUE_STATUS.WAITING_TEVAU, ISSUE_STATUS.REPLIED].includes(issue.status)) {
+    // A consumed token is replayable only for its exact Eric/issue binding.
+    // Let the repository return the original immutable result even if the issue
+    // has since advanced to RESOLVED/ARCHIVED.
+    if (session.status !== 'CONFIRMED'
+        && ![ISSUE_STATUS.WAITING_TEVAU, ISSUE_STATUS.REPLIED].includes(issue.status)) {
       throw new IssueDomainError(
         'ILLEGAL_TRANSITION',
         `Replies cannot be confirmed for an issue in ${issue.status}`

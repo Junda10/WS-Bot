@@ -3,6 +3,7 @@
 const { CandidateShortlistService, MAX_AI_CANDIDATES } = require('./candidate-shortlist-service');
 const { PmAiService } = require('./pm-ai-service');
 const { PmAddError, PmAddService } = require('./pm-add-service');
+const { PmReplyError, PmReplyService } = require('./pm-reply-service');
 const {
   ACTIONS,
   AuthorizationError,
@@ -23,6 +24,8 @@ module.exports = {
   PmAddError,
   PmAddService,
   PmAiService,
+  PmReplyError,
+  PmReplyService,
   AuthorizationError,
   IssueDomainError,
   IssueService,

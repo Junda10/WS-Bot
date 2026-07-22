@@ -198,7 +198,7 @@ specs:
     3. 在一个业务事务中分配编号、创建 issue/event/attachment links。
     4. 添加各附件类型、无引用、AI 失败、媒体过期和重复命令测试。
 
-- unstarted: Task 13 — 完成 AI 回复匹配与 Eric 确认
+- completed: Task 13 — 完成 AI 回复匹配与 Eric 确认
   - Description: 实现 `!pm reply`、候选缩小、AI 匹配、一次性确认会话、取消/过期和管理员纠错。
   - Dependencies: Tasks 4, 6, 11, 12
   - Acceptance Criteria:

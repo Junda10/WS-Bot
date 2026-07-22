@@ -51,6 +51,11 @@ class PermissionService {
     if (!this.authorizedChatJid) {
       throw new TypeError('authorizedChatJid must be a valid group JID');
     }
+    this.configuredEricJid = options.ericJid == null
+      ? null : this.normalizeJid(options.ericJid, { kind: 'user' });
+    if (options.ericJid != null && !this.configuredEricJid) {
+      throw new TypeError('ericJid must be a valid user JID');
+    }
   }
 
   // This check is deliberately first. No identity lookup, media download, AI call,
@@ -86,6 +91,13 @@ class PermissionService {
     const canonicalJid = this.normalizeJid(permission.canonical_jid, { kind: 'user' });
     if (!canonicalJid) {
       throw new AuthorizationError('INVALID_IDENTITY', 'Permission identity has an invalid canonical JID');
+    }
+    if (action === ACTIONS.CONFIRM_REPLY && this.configuredEricJid
+        && canonicalJid !== this.configuredEricJid) {
+      throw new AuthorizationError(
+        'ROLE_REQUIRED',
+        'Configured ERIC identity is required for reply matching'
+      );
     }
     return {
       action,

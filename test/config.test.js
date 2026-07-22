@@ -25,6 +25,7 @@ test('loads valid PM defaults and normalizes JIDs', () => {
   assert.equal(config.pm.authorizedGroupJid, '120300000000000000@g.us');
   assert.equal(config.pm.ericJid, '60111111111@c.us');
   assert.deepEqual(config.pm.adminJids, ['60222222222@c.us', '60333333333@lid']);
+  assert.equal(config.pm.replySessionTtlMs, 15 * 60 * 1000);
   assert.equal(config.storage.maxFileBytes, 20 * 1024 * 1024);
   assert.equal(config.storage.maxPdfPages, 100);
   assert.equal(config.storage.maxPdfTextItems, 500_000);
@@ -88,6 +89,7 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
     PM_MAX_EXTRACTED_CHARS: '-1',
     PM_FILE_PROCESSING_TIMEOUT_MS: '999999999',
     PM_MESSAGE_RETENTION_DAYS: '0',
+    PM_REPLY_SESSION_TTL_MS: '1000',
     PM_REPORT_RECOVERY_HOURS: 'forever',
     PM_TIMEZONE: 'Malaysia/Invalid',
     PM_VISION_POLICY: 'always-trust-ai',

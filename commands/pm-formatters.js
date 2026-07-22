@@ -76,9 +76,10 @@ function formatPmHelp(topic = '') {
 参数含空格时使用单引号或双引号；key=value 每个键只能出现一次。`;
   const eric = `🧭 *PM 命令帮助｜Eric*
 Eric 拥有群成员查询与更新权限。
-!pm reply — 匹配被引用的 Tevau 回复（后续功能）
-!pm confirm-reply TV1 — 确认匹配（后续功能）
-!pm cancel — 取消匹配（后续功能）`;
+!pm reply — 引用 Tevau 回复，建立 AI 建议与一次性确认会话
+!pm confirm-reply <token> TV1 — 使用 token 确认
+!pm confirm-reply TV1 — 必须引用 Bot 对应建议消息
+!pm cancel <token> — 取消；或引用 Bot 对应建议后发送 !pm cancel`;
   const admin = `🧭 *PM 命令帮助｜管理员*
 !pm archive TV1 reason="归档说明"
 !pm delete TV1 reason="删除原因"
@@ -291,6 +292,68 @@ function formatAddSuccess(result) {
   return lines.join('\n');
 }
 
+function formatReplySuggestion(result) {
+  const session = result.session;
+  const candidates = Array.isArray(result.candidates) ? result.candidates.slice(0, 3) : [];
+  const confidence = { low: '低', medium: '中', high: '高' }[session.ai_confidence] || '低';
+  const selected = session.ai_selected_public_id || '无可靠单一匹配';
+  const aiUnavailable = ['FAILED', 'INVALID', 'PROCESSING'].includes(session.ai_status)
+    ? '⚠️ AI 未产生可靠结果，以下为确定性安全候选；不会自动写入回复。'
+    : (session.ai_status === 'NO_MATCH'
+      ? 'ℹ️ AI 未找到可靠单一匹配；请 Eric 从候选手动选择。'
+      : '即使信心高，也必须由 Eric 明确确认。');
+  const lines = [
+    '🔎 *Tevau 回复匹配建议（待 Eric 确认）*',
+    `建议：${safeDisplayLine(selected)}`,
+    `理由：${safeDisplayLine(String(session.ai_reason || '未提供').slice(0, 600), { fallback: '未提供' })}`,
+    `信心：${confidence}`,
+    aiUnavailable,
+    '',
+    `*候选（${candidates.length}，最多 3 个）*`,
+  ];
+  for (const candidate of candidates) {
+    lines.push(
+      `${candidate.position}. ${safeDisplayLine(candidate.public_id)}｜${safeDisplayLine(candidate.title, { fallback: '（无标题）' })}`,
+      `   ${safeDisplayLine(String(candidate.reason || '').slice(0, 300), { fallback: '确定性候选' })}`
+    );
+  }
+  lines.push(
+    '',
+    `会话 token：${safeDisplayLine(session.token)}`,
+    `有效至：${formatTimestamp(session.expires_at)}`,
+    'token 是短时一次性确认凭据；明文显示仅用于发送失败或重启后的恢复，到期即失效。',
+    '确认（推荐携带 token）：',
+    `!pm confirm-reply ${safeDisplayLine(session.token)} ${safeDisplayLine(session.ai_selected_public_id || candidates[0]?.public_id || 'TVn')}`,
+    '也可引用本条 Bot 建议，仅发送：!pm confirm-reply TVn',
+    `取消：!pm cancel ${safeDisplayLine(session.token)}（或引用本条发送 !pm cancel）`
+  );
+  return lines.join('\n');
+}
+
+function formatReplyAlreadyPrompted(result) {
+  return `ℹ️ 此 Tevau 回复已有待确认会话，未重复调用 AI。\ntoken：${safeDisplayLine(result.session.token)}\n请使用：!pm confirm-reply ${safeDisplayLine(result.session.token)} TVn`;
+}
+
+function formatReplyConfirmed(result) {
+  const issue = result.issue;
+  return [
+    `✅ *已确认 Tevau 回复 → ${safeDisplayLine(issue.public_id)}*${result.replayed ? '（幂等重放）' : ''}`,
+    `标题：${safeDisplayLine(issue.title, { fallback: '（无标题）' })}`,
+    `状态：${statusLabel(issue.status)}`,
+    `首次响应耗时：${formatDuration(result.firstResponseDurationMs)}`,
+    '',
+    '*回复快照*',
+    formatDisplayBlock(String(result.reply.reply_text || '').slice(0, 1200), { fallback: '（无回复正文）' }),
+    '',
+    '下一步：商户验证恢复后发送：',
+    `!pm resolve ${safeDisplayLine(issue.public_id)} note="验证说明"`,
+  ].join('\n');
+}
+
+function formatReplyCancelled(result) {
+  return `✅ 已取消回复匹配会话 ${safeDisplayLine(result.session.token)}${result.session.replayed ? '（已取消）' : ''}；未写入任何工单回复。`;
+}
+
 function formatMutationSuccess(operation, result) {
   const issue = result.issue || result.targetIssue || result.record || result;
   const labels = {
@@ -368,6 +431,10 @@ module.exports = {
   formatMutationSuccess,
   formatOpenList,
   formatPmHelp,
+  formatReplyAlreadyPrompted,
+  formatReplyCancelled,
+  formatReplyConfirmed,
+  formatReplySuggestion,
   formatSearchResults,
   formatTimestamp,
   safeDisplayLine,

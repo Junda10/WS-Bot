@@ -11,6 +11,7 @@ const { IssueService } = require('./services/issue-service');
 const { PermissionService } = require('./services/permission-service');
 const { PmAiService } = require('./services/pm-ai-service');
 const { PmAddService } = require('./services/pm-add-service');
+const { PmReplyService } = require('./services/pm-reply-service');
 const { createDebouncedSmartReplyScheduler } = require('./services/debounced-smart-reply');
 const { AttachmentStorage } = require('./services/attachment-storage');
 const { AttachmentProcessingQueue } = require('./services/attachment-processing-queue');
@@ -56,6 +57,7 @@ try {
   permissionService = new PermissionService({
     repositories,
     authorizedChatJid: config.pm.authorizedGroupJid,
+    ericJid: config.pm.ericJid,
   });
   // Eric/admin identities are deployment configuration, not display names. Seed
   // their durable roles idempotently so command authorization works immediately.
@@ -161,7 +163,11 @@ const attachmentService = new AttachmentService({
   temporaryRetentionDays: config.retention.messageDays,
   clock: appClock,
 });
-const pmAiService = new PmAiService({ aiClient: require('./ai') });
+const pmAiService = new PmAiService({
+  aiClient: require('./ai'),
+  issueRepository: repositories.issues,
+  now: appClock,
+});
 const pmAddService = new PmAddService({
   repositories,
   permissionService,
@@ -170,11 +176,20 @@ const pmAddService = new PmAddService({
   aiService: pmAiService,
   attachmentWaitMs: config.storage.processingTimeoutMs + 5000,
 });
+const pmReplyService = new PmReplyService({
+  repositories,
+  permissionService,
+  issueService,
+  aiService: pmAiService,
+  ttlMs: config.pm.replySessionTtlMs,
+  clock: appClock,
+});
 const pmHandlers = createPmCommandHandlers({
   issueService,
   permissionService,
   attachmentService,
   pmAddService,
+  pmReplyService,
   adapter: whatsappAdapter,
   attachmentsDir: config.storage.attachmentsDir,
   clock: appClock,

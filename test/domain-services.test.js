@@ -254,9 +254,11 @@ test('member create/update/resolve, ERIC replies, and admin archive follow the o
   });
   assert.equal(archived.issue.status, ISSUE_STATUS.ARCHIVED);
   assert.equal(archived.issue.archived_at, 1500);
-  assert.throws(() => issues.confirmReply({
+  const replayedSecond = issues.confirmReply({
     chatJid: CHAT_JID, actorJid: ERIC_JID, token: 'TOKEN-SECOND', publicId: 'TV1',
-  }), errorCode('ILLEGAL_TRANSITION'));
+  });
+  assert.equal(replayedSecond.replayed, true);
+  assert.equal(repositories.issues.listReplies(created.id).length, 2);
 
   const events = repositories.issues.listEvents(created.id);
   assert.deepEqual(events.map((event) => event.event_type), [

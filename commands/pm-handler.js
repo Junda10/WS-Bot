@@ -6,12 +6,17 @@ const path = require('path');
 const { AuthorizationError } = require('../services/permission-service');
 const { IssueDomainError } = require('../services/issue-service');
 const { PmAddError } = require('../services/pm-add-service');
+const { PmReplyError, validToken } = require('../services/pm-reply-service');
 const {
   formatAddSuccess,
   formatIssueDetail,
   formatMutationSuccess,
   formatOpenList,
   formatPmHelp,
+  formatReplyAlreadyPrompted,
+  formatReplyCancelled,
+  formatReplyConfirmed,
+  formatReplySuggestion,
   formatSearchResults,
   safeDisplayLine,
   splitWhatsAppText,
@@ -161,6 +166,7 @@ function resolveArchivedAttachmentPath(storageKey, attachmentsDir) {
 function knownErrorMessage(error) {
   if (error instanceof CommandInputError) return `⚠️ 命令参数错误：${error.message}`;
   if (error instanceof PmAddError) return `❌ 建单未完成：${error.message}`;
+  if (error instanceof PmReplyError) return `❌ 回复匹配未完成：${error.message}`;
   if (error instanceof AuthorizationError) {
     if (error.code === 'ROLE_REQUIRED') return `⛔ 无权限：${error.message}`;
     return `⛔ 此处不能执行 PM 命令：${error.message}`;
@@ -198,6 +204,8 @@ function createPmCommandHandlers(options = {}) {
   const attachmentsDir = options.attachmentsDir;
   const attachmentService = options.attachmentService || null;
   const pmAddService = options.pmAddService || null;
+  const pmReplyService = options.pmReplyService || null;
+  const logger = options.logger || console;
 
   if (!issueService || typeof issueService.show !== 'function') {
     throw new TypeError('PM handlers require IssueService');
@@ -236,6 +244,28 @@ function createPmCommandHandlers(options = {}) {
         const outcome = await operation(context);
         if (outcome?.sentDirectly) return { ok: true, value: outcome.value };
         const receipts = await send(context, outcome.text);
+        if (outcome.bindReceipt) {
+          try {
+            await outcome.bindReceipt(receipts[0]);
+          } catch (bindingError) {
+            // The WhatsApp message is already visible and may contain an explicit
+            // short-lived token. Do not fail durable routing and resend it; quote
+            // binding is degraded, while token confirmation remains available.
+            logger.error?.('PM receipt binding failed after WhatsApp send; token fallback remains usable', {
+              error: bindingError,
+              whatsappMessageId: receipts[0]?.id || null,
+            });
+            return {
+              ok: true,
+              value: outcome.value,
+              receipts,
+              degraded: {
+                code: 'RECEIPT_BIND_FAILED',
+                message: String(bindingError?.message || 'Receipt binding failed'),
+              },
+            };
+          }
+        }
         return { ok: true, value: outcome.value, receipts };
       } catch (error) {
         const message = knownErrorMessage(error);
@@ -260,6 +290,100 @@ function createPmCommandHandlers(options = {}) {
       }
       const result = await pmAddService.add(context);
       return { text: formatAddSuccess(result), value: result };
+    }),
+
+    reply: wrap(async (context) => {
+      const identity = actorContext(context);
+      // Eric owns this interaction. Gate before inspecting quote provenance or
+      // invoking shortlist/AI/session code.
+      permissionService.authorize('CONFIRM_REPLY', identity);
+      if (!pmReplyService || typeof pmReplyService.prepare !== 'function') {
+        throw new PmReplyError('REPLY_UNAVAILABLE', '回复匹配服务尚未配置');
+      }
+      if (context.parsed.args.length > 0) {
+        throw new CommandInputError('TOO_MANY_ARGUMENTS', '!pm reply 不接受额外参数');
+      }
+      const result = await pmReplyService.prepare(context);
+      if (result.replayed && result.session.suggestion_whatsapp_message_id) {
+        return { text: formatReplyAlreadyPrompted(result), value: result };
+      }
+      return {
+        text: formatReplySuggestion(result),
+        value: result,
+        bindReceipt: (receipt) => pmReplyService.bindSuggestion(result.session.id, receipt),
+      };
+    }),
+
+    'confirm-reply': wrap(async (context) => {
+      const identity = actorContext(context);
+      permissionService.authorize('CONFIRM_REPLY', identity);
+      if (!pmReplyService || typeof pmReplyService.confirm !== 'function') {
+        throw new PmReplyError('REPLY_UNAVAILABLE', '回复匹配服务尚未配置');
+      }
+      const args = context.parsed.args;
+      let token = null;
+      let selectedPublicId;
+      let promptWhatsappMessageId = null;
+      if (args.length === 2) {
+        if (!validToken(args[0])) {
+          throw new CommandInputError('INVALID_REPLY_TOKEN', 'token 格式无效');
+        }
+        token = args[0];
+        selectedPublicId = publicId(args[1]);
+      } else if (args.length === 1) {
+        selectedPublicId = publicId(args[0]);
+        promptWhatsappMessageId = quoteSource(context);
+        if (!promptWhatsappMessageId) {
+          throw new CommandInputError(
+            'PROMPT_QUOTE_REQUIRED',
+            '省略 token 时必须引用 Bot 对应的回复匹配建议消息'
+          );
+        }
+      } else {
+        throw new CommandInputError(
+          'INVALID_CONFIRM_REPLY',
+          '用法：!pm confirm-reply <token> TVn；或引用 Bot 建议后发送 !pm confirm-reply TVn'
+        );
+      }
+      const result = pmReplyService.confirm(context, {
+        token,
+        promptWhatsappMessageId,
+        publicId: selectedPublicId,
+      });
+      const alreadySent = result.session.confirmation_whatsapp_message_id;
+      return {
+        text: alreadySent
+          ? `ℹ️ 此回复已确认到 ${safeDisplayLine(result.issue.public_id)}，没有重复写入。`
+          : formatReplyConfirmed(result),
+        value: result,
+        bindReceipt: alreadySent
+          ? null
+          : (receipt) => pmReplyService.bindConfirmation(result.session.id, receipt),
+      };
+    }),
+
+    cancel: wrap(async (context) => {
+      const identity = actorContext(context);
+      permissionService.authorize('CONFIRM_REPLY', identity);
+      if (!pmReplyService || typeof pmReplyService.cancel !== 'function') {
+        throw new PmReplyError('REPLY_UNAVAILABLE', '回复匹配服务尚未配置');
+      }
+      const args = context.parsed.args;
+      let token = null;
+      let promptWhatsappMessageId = null;
+      if (args.length === 1) {
+        if (!validToken(args[0])) throw new CommandInputError('INVALID_REPLY_TOKEN', 'token 格式无效');
+        token = args[0];
+      } else if (args.length === 0) {
+        promptWhatsappMessageId = quoteSource(context);
+        if (!promptWhatsappMessageId) {
+          throw new CommandInputError('CANCEL_TARGET_REQUIRED', '请提供 token 或引用 Bot 对应建议消息');
+        }
+      } else {
+        throw new CommandInputError('INVALID_CANCEL', '用法：!pm cancel <token>；或引用 Bot 建议后发送 !pm cancel');
+      }
+      const result = pmReplyService.cancel(context, { token, promptWhatsappMessageId });
+      return { text: formatReplyCancelled(result), value: result };
     }),
 
     help: wrap(async (context) => {

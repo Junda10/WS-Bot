@@ -42,16 +42,17 @@ class PmAiService {
     }
   }
 
-  // Task 13 integration seam. The service sends only a deterministic bounded
-  // shortlist to AI; it does not authorize Eric or confirm/save a reply.
-  async matchReply(replyEvidence, { chatId, maxCandidates } = {}) {
-    if (!this.candidateShortlist) {
-      return failure('SHORTLIST_UNAVAILABLE', 'Candidate shortlist service is not configured');
-    }
-    let candidates;
+  shortlistReply(replyEvidence, { chatId, maxCandidates } = {}) {
+    if (!this.candidateShortlist) return null;
     try {
-      candidates = this.candidateShortlist.shortlist(replyEvidence, { chatId, maxCandidates });
+      return this.candidateShortlist.shortlist(replyEvidence, { chatId, maxCandidates });
     } catch {
+      return null;
+    }
+  }
+
+  async matchReplyCandidates(replyEvidence, candidates) {
+    if (!Array.isArray(candidates)) {
       return failure('SHORTLIST_FAILED', 'Open issue candidates could not be shortlisted');
     }
     try {
@@ -59,6 +60,19 @@ class PmAiService {
     } catch {
       return failure('AI_CLIENT_FAILURE', 'Reply matching failed safely');
     }
+  }
+
+  // The service sends only a deterministic bounded shortlist to AI; it does
+  // not authorize Eric or confirm/save a reply.
+  async matchReply(replyEvidence, { chatId, maxCandidates } = {}) {
+    if (!this.candidateShortlist) {
+      return failure('SHORTLIST_UNAVAILABLE', 'Candidate shortlist service is not configured');
+    }
+    const candidates = this.shortlistReply(replyEvidence, { chatId, maxCandidates });
+    if (!candidates) {
+      return failure('SHORTLIST_FAILED', 'Open issue candidates could not be shortlisted');
+    }
+    return this.matchReplyCandidates(replyEvidence, candidates);
   }
 
   // Task 15 integration seam. Window calculation, PM report generation, and

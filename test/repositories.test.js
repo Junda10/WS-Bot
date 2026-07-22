@@ -89,7 +89,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   `).all().map((row) => row.name);
   for (const table of expectedTables) assert.ok(tables.includes(table), `${table} should exist`);
   assert.ok(tables.includes('issue_fts'));
-  assert.equal(db.pragma('user_version', { simple: true }), 8);
+  assert.equal(db.pragma('user_version', { simple: true }), 9);
   assert.deepEqual(db.pragma('foreign_key_check'), []);
   assert.deepEqual(
     db.prepare("SELECT name, next_value, updated_at FROM sequences WHERE name='issue_tv'").get(),
@@ -418,9 +418,13 @@ test('atomic reply confirmation consumes token, stores reply, updates issue/audi
   assert.equal(repositories.issues.search('登录', { chatId: chat.id }).length, 1);
   assert.equal(repositories.issues.search('结算回', { chatId: chat.id }).length, 1);
   assert.equal(repositories.issues.search('配置修', { chatId: chat.id }).length, 1);
-  assert.equal(repositories.replyMatches.confirm({
-    token: 'TOKEN-CONFIRM', ericJid: '601@c.us', issueId: issue.id, now: 2400,
-  }), null);
+  const replayed = repositories.replyMatches.confirm({
+    token: 'TOKEN-CONFIRM', ericJid: '601@c.us', issueId: issue.id,
+    eventUid: 'ignored-on-replay', replyUid: 'ignored-on-replay', now: 2400,
+  });
+  assert.equal(replayed.replayed, true);
+  assert.equal(replayed.reply.id, result.reply.id);
+  assert.equal(repositories.issues.listReplies(issue.id).length, 1);
   assert.throws(() => repositories.issues.appendEvent({
     eventUid: 'unsafe-confirm', issueId: issue.id, eventType: 'REPLY_CONFIRMED',
     actorJid: '601@c.us', replyText: 'unsafe', occurredAt: 2400,
@@ -679,18 +683,41 @@ test('reply session tokens/sources/candidates are unique and duplicate source de
   const messageTwo = seedMessage(repositories, chat.id, 'unique-two', 2001);
   const issueOne = seedIssue(repositories, chat.id, 'unique-one', 2100);
   const issueTwo = seedIssue(repositories, chat.id, 'unique-two', 2101);
-  const first = createReplySession(
-    repositories, chat.id, messageOne, issueOne, 'UNIQUE', 'same reply', 2200
-  );
-  const duplicate = repositories.replyMatches.create({
+  const sourceSnapshot = {
+    sourceSenderJid: '60999999999@c.us',
+    sourceSentAt: 2190,
+    sourceMedia: { type: 'document', fileName: 'reply.pdf' },
+  };
+  const first = repositories.replyMatches.create({
+    sessionUid: 'session-UNIQUE', token: 'TOKEN-UNIQUE', chatId: chat.id,
+    sourceMessageId: messageOne.id, sourceWhatsappMessageId: messageOne.whatsapp_message_id,
+    ericJid: '601@c.us', replyText: 'same reply', ...sourceSnapshot,
+    candidates: [{ issueId: issueOne.id, confidence: 0.9, reason: 'best match' }],
+    createdAt: 2200, expiresAt: 3200,
+  });
+  const replayInput = {
     sessionUid: 'ignored-session', token: 'OTHER-TOKEN', chatId: chat.id,
     sourceMessageId: messageOne.id, sourceWhatsappMessageId: messageOne.whatsapp_message_id,
-    ericJid: '601@c.us', replyText: 'same reply',
+    ericJid: '601@c.us', replyText: 'same reply', ...sourceSnapshot,
     candidates: [{ issueId: issueOne.id, confidence: 0.1, reason: 'retry' }],
     createdAt: 2201, expiresAt: 3201,
-  });
+  };
+  const duplicate = repositories.replyMatches.create(replayInput);
   assert.equal(duplicate.created, false);
   assert.equal(duplicate.record.id, first.record.id);
+  assert.throws(() => repositories.replyMatches.create({
+    ...replayInput, sourceMessageId: null,
+  }), /idempotency conflict on source_message_id/u);
+  for (const mismatch of [
+    { sourceSenderJid: '60888888888@c.us' },
+    { sourceSentAt: 2191 },
+    { sourceMedia: { type: 'document', fileName: 'different.pdf' } },
+    { replyText: 'changed source reply' },
+  ]) {
+    assert.throws(() => repositories.replyMatches.create({
+      ...replayInput, ...mismatch,
+    }), /reply match session idempotency conflict/u);
+  }
   assert.throws(() => repositories.replyMatches.create({
     sessionUid: 'token-collision', token: 'TOKEN-UNIQUE', chatId: chat.id,
     sourceMessageId: messageTwo.id, sourceWhatsappMessageId: messageTwo.whatsapp_message_id,

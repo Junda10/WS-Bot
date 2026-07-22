@@ -117,6 +117,7 @@ function loadConfig(env = process.env) {
       authorizedGroupJid: normalizeJid(env.PM_AUTHORIZED_GROUP_JID, { kind: 'group' }),
       ericJid: normalizeJid(env.PM_ERIC_JID),
       adminJids: normalizeJidList(env.PM_ADMIN_JIDS),
+      replySessionTtlMs: readInteger(env, 'PM_REPLY_SESSION_TTL_MS', 15 * 60 * 1000),
     },
 
     database: {
@@ -276,6 +277,7 @@ function validateConfig(config, { requirePm = true } = {}) {
   );
   integerInRange(config.storage.maxQueuePending, 1, 100_000, 'PM_ATTACHMENT_QUEUE_MAX_PENDING');
   integerInRange(config.retention.messageDays, 1, 3650, 'PM_MESSAGE_RETENTION_DAYS');
+  integerInRange(config.pm.replySessionTtlMs, 60_000, 24 * 60 * 60 * 1000, 'PM_REPLY_SESSION_TTL_MS');
   validTimezone(config.reports.timezone, 'PM_TIMEZONE');
   integerInRange(config.reports.recoveryWindowHours, 1, 168, 'PM_REPORT_RECOVERY_HOURS');
   validBoolean(config.media.ocrEnabled, 'PM_OCR_ENABLED');
