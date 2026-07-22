@@ -7,10 +7,10 @@ const PM_HELP = formatPmHelp();
 
 const SUMMARY_HELP = `🧾 *群聊摘要命令帮助*
 !summary — 总结默认时间窗
-!summary 4h — 总结最近 4 小时
+!summary Nh — 总结最近 N 小时（受配置上限约束，例如 4h）
 !summary today — 总结今天
 !summary yesterday — 总结昨天
-!summary since "2026-07-20 09:00" — 从指定时间总结`;
+!summary since 2026-07-20 09:00 — 从指定时间总结`;
 
 function requireHandler(handler, name) {
   if (typeof handler !== 'function') throw new TypeError(`${name} handler must be a function`);
@@ -29,10 +29,11 @@ function sanitizeReflectedCommand(value, maxLength = 40) {
 function isRecognizedSummaryRequest(tokens) {
   if (tokens.length === 0) return true;
   if (tokens.length === 1) {
-    return /^(?:today|yesterday|\d+[smhd])$/iu.test(tokens[0]);
+    return /^(?:today|yesterday|\d+h)$/iu.test(tokens[0]);
   }
-  return tokens.length === 2 && tokens[0].toLowerCase() === 'since'
-    && tokens[1].trim().length > 0;
+  return (tokens.length === 2 || tokens.length === 3)
+    && tokens[0].toLowerCase() === 'since'
+    && tokens.slice(1).every((token) => token.trim().length > 0);
 }
 
 class CommandRouter {

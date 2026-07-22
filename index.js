@@ -22,7 +22,10 @@ const { OcrWorkerService } = require('./services/ocr-worker-service');
 const { WhatsAppAdapter } = require('./whatsapp/adapter');
 const { AuthorizedGroupIngress, createMessageEventHandler } = require('./whatsapp/ingress');
 const { createPmCommandHandlers } = require('./commands/pm-handler');
+const { createSummaryHandler } = require('./commands/summary-handler');
 const { createCommandRouter } = require('./commands/router');
+const { ConversationSummaryService } = require('./summaries/conversation-summary');
+const { ManualSummaryService } = require('./summaries/manual-summary-service');
 
 const appClock = () => Date.now();
 
@@ -194,9 +197,26 @@ const pmHandlers = createPmCommandHandlers({
   attachmentsDir: config.storage.attachmentsDir,
   clock: appClock,
 });
+const conversationSummaryService = new ConversationSummaryService({
+  repositories,
+  aiService: pmAiService,
+  timezone: config.reports.timezone,
+});
+const manualSummaryService = new ManualSummaryService({
+  repositories,
+  conversationService: conversationSummaryService,
+  timezone: config.reports.timezone,
+  maxHours: config.reports.maxManualHours,
+  maxSinceDays: config.retention.messageDays,
+});
+const summaryHandler = createSummaryHandler({
+  summaryService: manualSummaryService,
+  adapter: whatsappAdapter,
+});
 const namespacedCommandRouter = createCommandRouter({
   permissionService,
   pmHandlers,
+  summaryHandler,
   clock: appClock,
 });
 

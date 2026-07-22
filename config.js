@@ -156,6 +156,7 @@ function loadConfig(env = process.env) {
     reports: {
       timezone,
       recoveryWindowHours: readInteger(env, 'PM_REPORT_RECOVERY_HOURS', 24),
+      maxManualHours: readInteger(env, 'PM_SUMMARY_MAX_HOURS', 168),
     },
 
     media: {
@@ -280,6 +281,7 @@ function validateConfig(config, { requirePm = true } = {}) {
   integerInRange(config.pm.replySessionTtlMs, 60_000, 24 * 60 * 60 * 1000, 'PM_REPLY_SESSION_TTL_MS');
   validTimezone(config.reports.timezone, 'PM_TIMEZONE');
   integerInRange(config.reports.recoveryWindowHours, 1, 168, 'PM_REPORT_RECOVERY_HOURS');
+  integerInRange(config.reports.maxManualHours, 1, 8760, 'PM_SUMMARY_MAX_HOURS');
   validBoolean(config.media.ocrEnabled, 'PM_OCR_ENABLED');
   if (!/^[a-z0-9_]+(?:\+[a-z0-9_]+)*$/u.test(config.media.ocrLanguages)
       || config.media.ocrLanguages.split('+').length > 8) {

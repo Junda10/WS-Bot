@@ -104,6 +104,24 @@ class SummaryRepository {
     ) || null;
   }
 
+  /**
+   * Read-only cursor lookup for manual summaries. Manual commands must never
+   * claim, update, or otherwise advance an automatic report run.
+   */
+  latestSuccessfulAutomatic(chatId, atOrBefore = Number.MAX_SAFE_INTEGER) {
+    return this.db.prepare(`
+      SELECT * FROM summary_runs
+      WHERE chat_id = @chatId AND status = 'SUCCEEDED'
+        AND report_type IN ('AUTO_10', 'AUTO_14', 'AUTO_20')
+        AND window_end <= @atOrBefore
+      ORDER BY window_end DESC, completed_at DESC, id DESC
+      LIMIT 1
+    `).get({
+      chatId: requireInteger(chatId, 'chatId', { min: 1 }),
+      atOrBefore: requireTimestamp(atOrBefore, 'atOrBefore'),
+    }) || null;
+  }
+
   addPart(input) {
     const content = requireString(input.content, 'content', { max: 1000000 });
     const values = {

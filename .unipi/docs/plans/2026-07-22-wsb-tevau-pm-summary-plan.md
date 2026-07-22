@@ -226,7 +226,7 @@ specs:
     3. 建立 deterministic report model 与格式化函数。
     4. 测试跨日、月末、年末、时区和空数据。
 
-- unstarted: Task 15 — 实现手动及 AI 群聊/Markdown 摘要
+- completed: Task 15 — 实现手动及 AI 群聊/Markdown 摘要
   - Description: 对聊天文字和普通 Markdown extracted text 分块总结，组合确定性 PM 部分并稳定拆分 WhatsApp 消息。
   - Dependencies: Tasks 9, 11, 14
   - Acceptance Criteria:
