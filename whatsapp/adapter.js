@@ -107,6 +107,52 @@ class WhatsAppAdapter {
     return receipts;
   }
 
+  /**
+   * Look for a recent bot-authored message containing an exact durable outbox
+   * marker. `available:false` is deliberately distinct from "searched, not
+   * found" so callers can log their explicit at-least-once fallback.
+   */
+  async findRecentOutgoingByMarker(chatJid, marker, options = {}) {
+    const target = normalizeChatJid(chatJid);
+    if (!target) throw new TypeError('marker lookup requires a valid chat JID');
+    if (typeof marker !== 'string' || !/^WSB-RPT-[A-F0-9]{20}-P\d{1,5}$/u.test(marker)) {
+      throw new TypeError('marker must be a sanitized scheduled-report marker');
+    }
+    const limit = options.limit ?? 50;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) {
+      throw new TypeError('marker lookup limit must be an integer from 1 to 200');
+    }
+    if (typeof this.client.getChatById !== 'function') {
+      return Object.freeze({ available: false, receipt: null, reason: 'getChatById unavailable' });
+    }
+    let chat;
+    try {
+      chat = await this.client.getChatById(target);
+    } catch (error) {
+      return Object.freeze({ available: false, receipt: null, reason: `chat lookup failed: ${error.message}` });
+    }
+    if (!chat || typeof chat.fetchMessages !== 'function') {
+      return Object.freeze({ available: false, receipt: null, reason: 'fetchMessages unavailable' });
+    }
+    let messages;
+    try {
+      messages = await chat.fetchMessages({ limit, fromMe: true });
+    } catch (error) {
+      return Object.freeze({ available: false, receipt: null, reason: `message lookup failed: ${error.message}` });
+    }
+    const found = (Array.isArray(messages) ? messages : []).find((message) => {
+      const fromMe = message?.fromMe === true || message?.id?.fromMe === true
+        || message?._data?.id?.fromMe === true;
+      const body = String(message?.body ?? message?._data?.body ?? '');
+      return fromMe && body.includes(`[${marker}]`);
+    });
+    return Object.freeze({
+      available: true,
+      receipt: found ? sentReceipt(found) : null,
+      reason: null,
+    });
+  }
+
   _assertDownloadedIdentity(message, options = {}) {
     if (!options.expectedMessageId && !options.expectedChatJid) return;
     const actualId = serializedId(message?.id || message?._data?.id);

@@ -26,6 +26,10 @@ const { createSummaryHandler } = require('./commands/summary-handler');
 const { createCommandRouter } = require('./commands/router');
 const { ConversationSummaryService } = require('./summaries/conversation-summary');
 const { ManualSummaryService } = require('./summaries/manual-summary-service');
+const { ScheduledSummaryService } = require('./summaries/scheduled-summary-service');
+const { PersistentSummaryRunner } = require('./summaries/persistent-summary-runner');
+const { SummaryRecoveryService } = require('./summaries/summary-recovery-service');
+const { PersistentSummaryScheduler } = require('./summaries/persistent-summary-scheduler');
 
 const appClock = () => Date.now();
 
@@ -40,6 +44,7 @@ let database;
 let repositories;
 let permissionService;
 let issueService;
+let authorizedChat;
 try {
   database = getDatabase({
     filename: config.database.path,
@@ -47,7 +52,7 @@ try {
   });
   const migrationResult = migrateDatabase(database);
   repositories = createRepositories(database);
-  let authorizedChat = repositories.chats.findByJid(config.pm.authorizedGroupJid, {
+  authorizedChat = repositories.chats.findByJid(config.pm.authorizedGroupJid, {
     includeDeleted: true,
   });
   if (!authorizedChat) {
@@ -213,6 +218,38 @@ const summaryHandler = createSummaryHandler({
   summaryService: manualSummaryService,
   adapter: whatsappAdapter,
 });
+const scheduledSummaryService = new ScheduledSummaryService({
+  repositories,
+  conversationService: conversationSummaryService,
+  timezone: config.reports.timezone,
+});
+let whatsappReady = false;
+const persistentSummaryRunner = new PersistentSummaryRunner({
+  repositories,
+  summaryService: scheduledSummaryService,
+  adapter: whatsappAdapter,
+  chat: authorizedChat,
+  timezone: config.reports.timezone,
+  clock: appClock,
+  logger: console,
+});
+const summaryRecoveryService = new SummaryRecoveryService({
+  repositories,
+  runner: persistentSummaryRunner,
+  chat: authorizedChat,
+  adapterReady: () => whatsappReady,
+  timezone: config.reports.timezone,
+  recoveryHours: config.reports.recoveryWindowHours,
+  clock: appClock,
+  logger: console,
+});
+const persistentSummaryScheduler = new PersistentSummaryScheduler({
+  cron,
+  runner: persistentSummaryRunner,
+  recovery: summaryRecoveryService,
+  timezone: config.reports.timezone,
+  logger: console,
+});
 const namespacedCommandRouter = createCommandRouter({
   permissionService,
   pmHandlers,
@@ -242,11 +279,13 @@ client.on('qr', (qr) => {
 });
 
 let schedulesRegistered = false;
+const legacyCronTasks = [];
 let attachmentRecoveryComplete = false;
 let attachmentRecoveryPromise = null;
 let attachmentRecoveryRetryTimer = null;
 async function onWhatsAppReady() {
   console.log('✅ 机器人已连接!');
+  whatsappReady = true;
 
   // Authorized ingress starts closed. This makes it safe to reclaim every
   // prior-process claim immediately, even when its old lease has not expired.
@@ -289,6 +328,10 @@ async function onWhatsAppReady() {
     }
   }
 
+  // Persistent summary registration is independently idempotent and starts only
+  // after migrations, WhatsApp ready, and authorized-ingress recovery succeeded.
+  await persistentSummaryScheduler.start();
+
   if (schedulesRegistered) {
     console.log('ℹ️ 定时任务已注册，跳过重复 ready 初始化');
     return;
@@ -298,14 +341,14 @@ async function onWhatsAppReady() {
   const min = String(config.scheduleMinute);
   const hr = String(config.scheduleHour);
   // Interpret the schedule in scheduleTz (default MY time), not the server's UTC clock.
-  cron.schedule(`${min} ${hr} * * *`, () => sendMorningNews(), { timezone: config.scheduleTz });
+  legacyCronTasks.push(cron.schedule(`${min} ${hr} * * *`, () => sendMorningNews(), { timezone: config.scheduleTz }));
   console.log(`⏰ 每天 ${config.scheduleHour}:${String(config.scheduleMinute).padStart(2, '0')} (${config.scheduleTz}) 自动发送AI新闻摘要`);
 
   // 每日健身教练提醒（默认中午 12:00 大马时间，把当天训练/休息计划发给自己）。
   if (config.fitness?.enabled) {
     const fMin = String(config.fitness.minute);
     const fHr = String(config.fitness.hour);
-    cron.schedule(`${fMin} ${fHr} * * *`, () => sendFitnessReminder(), { timezone: config.scheduleTz });
+    legacyCronTasks.push(cron.schedule(`${fMin} ${fHr} * * *`, () => sendFitnessReminder(), { timezone: config.scheduleTz }));
     console.log(`🏋️ 每天 ${config.fitness.hour}:${String(config.fitness.minute).padStart(2, '0')} (${config.scheduleTz}) 自动发送健身提醒`);
   }
 
@@ -313,7 +356,7 @@ async function onWhatsAppReady() {
   if (config.fx?.enabled) {
     const xMin = String(config.fx.minute);
     const xHr = String(config.fx.hour);
-    cron.schedule(`${xMin} ${xHr} * * *`, () => sendFxUpdate(), { timezone: config.scheduleTz });
+    legacyCronTasks.push(cron.schedule(`${xMin} ${xHr} * * *`, () => sendFxUpdate(), { timezone: config.scheduleTz }));
     console.log(`💱 每天 ${config.fx.hour}:${String(config.fx.minute).padStart(2, '0')} (${config.scheduleTz}) 自动发送汇率推送`);
   }
 
@@ -331,6 +374,7 @@ let reinitTimer = null;
 let reinitInProgress = false;
 client.on('disconnected', (reason) => {
   console.log('🔌 断开连接:', reason);
+  whatsappReady = false;
   // Debounce + guard: avoid a tight re-initialize loop on repeated disconnects.
   if (reinitInProgress) return;
   if (reinitTimer) clearTimeout(reinitTimer);
@@ -1027,6 +1071,12 @@ async function shutdown(signal) {
   shuttingDown = true;
   console.log(`🛑 ${signal} received, shutting down...`);
 
+  persistentSummaryScheduler.stop();
+  for (const task of legacyCronTasks) {
+    try { task.stop?.(); } catch (error) {
+      console.warn(`Legacy cron shutdown failed: ${error.message}`);
+    }
+  }
   if (reinitTimer) {
     clearTimeout(reinitTimer);
     reinitTimer = null;
@@ -1036,6 +1086,11 @@ async function shutdown(signal) {
     attachmentRecoveryRetryTimer = null;
   }
   attachmentService.stopRecovery();
+
+  const summaryDrain = await persistentSummaryScheduler.drain({ timeoutMs: 10_000 });
+  if (summaryDrain.timedOut) {
+    console.warn(`Scheduled summary drain timed out with ${summaryDrain.remaining} run(s) still active`);
+  }
 
   // Stop admission first, then let accepted handlers finish their durable
   // PROCESSED/FAILED transition before either transport or database disappears.

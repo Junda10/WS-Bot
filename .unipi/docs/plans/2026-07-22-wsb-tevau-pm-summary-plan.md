@@ -242,7 +242,7 @@ specs:
     4. 实现 deterministic message splitter 和格式化。
     5. 测试 Markdown 来源、空窗口、长窗口、失败降级和不改自动游标。
 
-- unstarted: Task 16 — 实现持久定时调度、分段发送与启动补报
+- completed: Task 16 — 实现持久定时调度、分段发送与启动补报
   - Description: 保留 `node-cron`，将 cron 降为触发器，以 SQLite run/part ledger 负责 claim、重试、防重复和恢复。
   - Dependencies: Tasks 5, 14, 15
   - Acceptance Criteria:

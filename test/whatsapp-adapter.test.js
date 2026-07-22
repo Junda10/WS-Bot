@@ -220,6 +220,39 @@ test('adapter sends text, ordered parts, quoted replies, and archived attachment
   assert.equal(mediaCalls[0].filePath, archivedPath);
 });
 
+test('adapter finds only recent bot outgoing messages by sanitized report marker and exposes lookup availability', async () => {
+  const marker = 'WSB-RPT-ABCDEF0123456789ABCD-P2';
+  const client = {
+    async sendMessage() {},
+    async getChatById(chatJid) {
+      assert.equal(chatJid, GROUP_JID);
+      return {
+        async fetchMessages(options) {
+          assert.deepEqual(options, { limit: 25, fromMe: true });
+          return [
+            { fromMe: false, body: `[${marker}]`, id: { _serialized: 'incoming' } },
+            { fromMe: true, body: `summary\n[${marker}]`, timestamp: 1_720_000_100, id: { _serialized: 'outgoing', fromMe: true } },
+          ];
+        },
+      };
+    },
+  };
+  const found = await new WhatsAppAdapter({ client })
+    .findRecentOutgoingByMarker(GROUP_JID, marker, { limit: 25 });
+  assert.equal(found.available, true);
+  assert.equal(found.receipt.id, 'outgoing');
+  assert.equal(found.receipt.sentAt, 1_720_000_100_000);
+
+  const unavailable = await new WhatsAppAdapter({ client: { async sendMessage() {} } })
+    .findRecentOutgoingByMarker(GROUP_JID, marker);
+  assert.equal(unavailable.available, false);
+  assert.match(unavailable.reason, /getChatById/u);
+  await assert.rejects(
+    new WhatsAppAdapter({ client }).findRecentOutgoingByMarker(GROUP_JID, 'unsafe marker'),
+    /sanitized/u
+  );
+});
+
 test('wrapIncoming preserves text reply return/options and delegates rich content', async () => {
   const client = new FakeClient();
   const richCalls = [];

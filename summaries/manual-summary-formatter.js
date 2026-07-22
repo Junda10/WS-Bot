@@ -60,7 +60,13 @@ function formatQueueIssue(issue, timezone) {
   ];
 }
 
-function formatManualSummary({ window, conversation, pmReport }) {
+function formatManualSummary({
+  window,
+  conversation,
+  pmReport,
+  heading = '🧾 *群聊与 PM 摘要*',
+  includeCurrentQueues = true,
+}) {
   if (!window || !conversation || !pmReport) {
     throw new TypeError('window, conversation, and pmReport are required');
   }
@@ -69,7 +75,7 @@ function formatManualSummary({ window, conversation, pmReport }) {
   const semantic = ai.value;
   const hasEvidence = conversation.records.length > 0;
   const lines = [
-    '🧾 *群聊与 PM 摘要*',
+    heading,
     '',
     '*时间窗口*',
     `${local(window.startUtcMs, timezone)} → ${local(window.endUtcMs, timezone)}（${timezone}）`,
@@ -107,6 +113,16 @@ function formatManualSummary({ window, conversation, pmReport }) {
     }
   }
 
+  if (pmReport.previousDayStats) {
+    const stats = pmReport.previousDayStats;
+    lines.push(
+      '',
+      `*昨日工单统计｜${local(stats.startUtcMs, timezone, 'yyyy-LL-dd')}*`,
+      `新增：${stats.createdIssueCount}｜确认回复：${stats.confirmedReplyIssueCount} 个工单 / ${stats.confirmedReplyEventCount} 条事件`,
+      `解决：${stats.resolvedIssueCount}｜日终仍未闭环：${stats.unresolvedAtEndIssueCount}`
+    );
+  }
+
   lines.push('', '*本窗口工单变化*');
   if (pmReport.changeEventCount === 0) {
     lines.push('（无工单变化）');
@@ -119,16 +135,20 @@ function formatManualSummary({ window, conversation, pmReport }) {
     }
   }
 
-  lines.push('', `*全部等待 Tevau 回复（${pmReport.queues.waitingTevau.length}）*`);
-  if (!pmReport.queues.waitingTevau.length) lines.push('（无）');
-  for (const issue of pmReport.queues.waitingTevau) {
-    lines.push(...formatQueueIssue(issue, timezone));
-  }
+  if (includeCurrentQueues) {
+    lines.push('', `*全部等待 Tevau 回复（${pmReport.queues.waitingTevau.length}）*`);
+    if (!pmReport.queues.waitingTevau.length) lines.push('（无）');
+    for (const issue of pmReport.queues.waitingTevau) {
+      lines.push(...formatQueueIssue(issue, timezone));
+    }
 
-  lines.push('', `*全部已回复但未解决（${pmReport.queues.repliedUnresolved.length}）*`);
-  if (!pmReport.queues.repliedUnresolved.length) lines.push('（无）');
-  for (const issue of pmReport.queues.repliedUnresolved) {
-    lines.push(...formatQueueIssue(issue, timezone));
+    lines.push('', `*全部已回复但未解决（${pmReport.queues.repliedUnresolved.length}）*`);
+    if (!pmReport.queues.repliedUnresolved.length) lines.push('（无）');
+    for (const issue of pmReport.queues.repliedUnresolved) {
+      lines.push(...formatQueueIssue(issue, timezone));
+    }
+  } else {
+    lines.push('', '*当前未闭环队列*', '（合并补报末段统一列出，避免重复。）');
   }
 
   const uncertain = [];
@@ -146,12 +166,14 @@ function formatManualSummary({ window, conversation, pmReport }) {
     const state = gap.kind === 'MARKDOWN_PARSE_FAILED' ? '解析失败' : '仍待解析';
     uncertain.push(`Markdown「${safeDisplayLine(gap.filename)}」${state}，本次未纳入语义摘要。`);
   }
-  for (const item of pmReport.uncertainties) {
-    uncertain.push(`${safeDisplayLine(item.publicId, { fallback: `工单#${item.issueId}` })}｜${safeDisplayLine(item.text, { fallback: '工单资料不确定' })}`);
-  }
-  for (const gap of pmReport.dataGaps) {
-    const count = gap.count ? `（${gap.count}）` : '';
-    uncertain.push(`${safeDisplayLine(gap.publicId, { fallback: `工单#${gap.issueId}` })}｜${PM_GAP_LABELS[gap.kind] || safeDisplayLine(gap.kind)}${count}`);
+  if (includeCurrentQueues) {
+    for (const item of pmReport.uncertainties) {
+      uncertain.push(`${safeDisplayLine(item.publicId, { fallback: `工单#${item.issueId}` })}｜${safeDisplayLine(item.text, { fallback: '工单资料不确定' })}`);
+    }
+    for (const gap of pmReport.dataGaps) {
+      const count = gap.count ? `（${gap.count}）` : '';
+      uncertain.push(`${safeDisplayLine(gap.publicId, { fallback: `工单#${gap.issueId}` })}｜${PM_GAP_LABELS[gap.kind] || safeDisplayLine(gap.kind)}${count}`);
+    }
   }
 
   lines.push('', `*不确定 / 待处理数据（${uncertain.length}）*`);

@@ -13,6 +13,7 @@ const {
 } = require('./shared');
 
 const REPORT_TYPES = new Set(['AUTO_10', 'AUTO_14', 'AUTO_20', 'MANUAL', 'RECOVERY']);
+const AUTOMATIC_REPORT_TYPES = new Set(['AUTO_10', 'AUTO_14', 'AUTO_20']);
 const DEFAULT_LEASE_MS = 60_000;
 
 function reportType(value) {
@@ -60,6 +61,23 @@ class SummaryRepository {
       throw new RangeError('windowEnd must be greater than windowStart');
     }
     return immediate(this.db, () => {
+      if (AUTOMATIC_REPORT_TYPES.has(values.reportType)) {
+        const owner = this.db.prepare(`
+          SELECT r.* FROM summary_run_coverage c
+          JOIN summary_runs r ON r.id = c.run_id
+          WHERE c.chat_id = ? AND c.report_type = ?
+            AND c.window_start = ? AND c.window_end = ?
+        `).get(values.chatId, values.reportType, values.windowStart, values.windowEnd);
+        if (owner && owner.report_type !== values.reportType) {
+          return {
+            record: owner,
+            created: false,
+            reclaimed: false,
+            coveredByOther: true,
+          };
+        }
+      }
+
       const created = this.db.prepare(`
         INSERT INTO summary_runs (
           run_uid, chat_id, report_type, window_start, window_end, scheduled_for,
@@ -70,12 +88,31 @@ class SummaryRepository {
         ) ON CONFLICT(chat_id, report_type, window_start, window_end) DO NOTHING
         RETURNING *
       `).get(values);
-      if (created) return { record: created, created: true, reclaimed: false };
-
-      const existing = this.byWindow.get(
+      const existing = created || this.byWindow.get(
         values.chatId, values.reportType, values.windowStart, values.windowEnd
       );
       assertIdempotent(existing, { scheduled_for: values.scheduledFor }, ['scheduled_for'], 'summary run');
+
+      if (AUTOMATIC_REPORT_TYPES.has(values.reportType)) {
+        this.db.prepare(`
+          INSERT INTO summary_run_coverage (
+            run_id, chat_id, report_type, window_start, window_end,
+            scheduled_for, coverage_kind, created_at
+          ) VALUES (
+            @runId, @chatId, @reportType, @windowStart, @windowEnd,
+            @scheduledFor, 'DIRECT', @now
+          ) ON CONFLICT(chat_id, report_type, window_start, window_end) DO NOTHING
+        `).run({ ...values, runId: existing.id });
+        const coverage = this.db.prepare(`
+          SELECT run_id FROM summary_run_coverage
+          WHERE chat_id = ? AND report_type = ? AND window_start = ? AND window_end = ?
+        `).get(values.chatId, values.reportType, values.windowStart, values.windowEnd);
+        if (coverage.run_id !== existing.id) {
+          throw new Error('Scheduled summary window was claimed concurrently by recovery');
+        }
+      }
+
+      if (created) return { record: created, created: true, reclaimed: false };
       if (existing.status === 'SUCCEEDED') {
         return { record: existing, created: false, reclaimed: false };
       }
@@ -96,6 +133,114 @@ class SummaryRepository {
         reclaimed: Boolean(reclaimed),
       };
     });
+  }
+
+  claimRecovery(input) {
+    if (!Array.isArray(input.windows) || input.windows.length < 2) {
+      throw new TypeError('Combined recovery requires at least two constituent windows');
+    }
+    const windows = input.windows.map((window) => ({
+      chatId: requireInteger(window.chatId ?? input.chatId, 'chatId', { min: 1 }),
+      reportType: reportType(window.reportType),
+      windowStart: requireTimestamp(window.windowStart, 'windowStart'),
+      windowEnd: requireTimestamp(window.windowEnd, 'windowEnd'),
+      scheduledFor: requireTimestamp(window.scheduledFor, 'scheduledFor'),
+    }));
+    if (windows.some((window) => !AUTOMATIC_REPORT_TYPES.has(window.reportType))) {
+      throw new TypeError('Recovery coverage may contain only automatic report windows');
+    }
+    const chatId = requireInteger(input.chatId, 'chatId', { min: 1 });
+    if (windows.some((window) => window.chatId !== chatId || window.windowEnd <= window.windowStart)) {
+      throw new RangeError('Recovery windows must belong to one chat and have valid boundaries');
+    }
+    const sorted = [...windows].sort((left, right) => left.scheduledFor - right.scheduledFor
+      || left.reportType.localeCompare(right.reportType, 'en'));
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    const now = requireTimestamp(input.now, 'now');
+    const claimInput = {
+      runUid: uid(input.runUid, 'runUid'),
+      chatId,
+      reportType: 'RECOVERY',
+      windowStart: first.windowStart,
+      windowEnd: last.windowEnd,
+      scheduledFor: last.scheduledFor,
+      now,
+      leaseExpiresAt: leaseExpiry(now, input.leaseMs),
+    };
+
+    return immediate(this.db, () => {
+      const owners = sorted.map((window) => this.db.prepare(`
+        SELECT c.run_id, r.report_type FROM summary_run_coverage c
+        JOIN summary_runs r ON r.id = c.run_id
+        WHERE c.chat_id = ? AND c.report_type = ?
+          AND c.window_start = ? AND c.window_end = ?
+      `).get(chatId, window.reportType, window.windowStart, window.windowEnd) || null);
+      const ownerIds = new Set(owners.filter(Boolean).map((owner) => owner.run_id));
+      if (ownerIds.size > 1 || (ownerIds.size === 1 && owners.some((owner) => owner === null))) {
+        return { record: null, conflict: true, created: false, reclaimed: false };
+      }
+      if (owners.some((owner) => owner && owner.report_type !== 'RECOVERY')) {
+        return { record: null, conflict: true, created: false, reclaimed: false };
+      }
+
+      let run = this.byWindow.get(chatId, 'RECOVERY', first.windowStart, last.windowEnd);
+      let created = false;
+      if (!run) {
+        run = this.db.prepare(`
+          INSERT INTO summary_runs (
+            run_uid, chat_id, report_type, window_start, window_end, scheduled_for,
+            status, attempt_count, claimed_at, lease_expires_at, created_at, updated_at
+          ) VALUES (
+            @runUid, @chatId, 'RECOVERY', @windowStart, @windowEnd, @scheduledFor,
+            'RUNNING', 1, @now, @leaseExpiresAt, @now, @now
+          ) RETURNING *
+        `).get(claimInput);
+        created = true;
+      } else {
+        assertIdempotent(run, { scheduled_for: last.scheduledFor }, ['scheduled_for'], 'recovery run');
+      }
+      if (ownerIds.size === 1 && !ownerIds.has(run.id)) {
+        return { record: null, conflict: true, created: false, reclaimed: false };
+      }
+
+      for (const window of sorted) {
+        this.db.prepare(`
+          INSERT INTO summary_run_coverage (
+            run_id, chat_id, report_type, window_start, window_end,
+            scheduled_for, coverage_kind, created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, 'COMBINED_RECOVERY', ?)
+          ON CONFLICT(chat_id, report_type, window_start, window_end) DO NOTHING
+        `).run(run.id, chatId, window.reportType, window.windowStart,
+          window.windowEnd, window.scheduledFor, now);
+      }
+      if (created) return { record: run, conflict: false, created: true, reclaimed: false };
+      if (run.status === 'SUCCEEDED') {
+        return { record: run, conflict: false, created: false, reclaimed: false };
+      }
+      const reclaimed = this.db.prepare(`
+        UPDATE summary_runs
+        SET status = 'RUNNING', attempt_count = attempt_count + 1,
+            claimed_at = @now, lease_expires_at = @leaseExpiresAt,
+            completed_at = NULL, updated_at = @now, last_error = NULL
+        WHERE id = @id AND (
+          status IN ('PENDING', 'FAILED')
+          OR (status = 'RUNNING' AND lease_expires_at <= @now)
+        ) RETURNING *
+      `).get({ id: run.id, now, leaseExpiresAt: claimInput.leaseExpiresAt });
+      return {
+        record: reclaimed || run,
+        conflict: false,
+        created: false,
+        reclaimed: Boolean(reclaimed),
+      };
+    });
+  }
+
+  findById(runId) {
+    return this.db.prepare('SELECT * FROM summary_runs WHERE id = ?').get(
+      requireInteger(runId, 'runId', { min: 1 })
+    ) || null;
   }
 
   findByUid(runUid) {
@@ -120,6 +265,24 @@ class SummaryRepository {
       chatId: requireInteger(chatId, 'chatId', { min: 1 }),
       atOrBefore: requireTimestamp(atOrBefore, 'atOrBefore'),
     }) || null;
+  }
+
+  listCoverage(chatId, windows) {
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    if (!Array.isArray(windows)) throw new TypeError('windows must be an array');
+    return windows.map((window) => {
+      const type = reportType(window.reportType);
+      const start = requireTimestamp(window.windowStart, 'windowStart');
+      const end = requireTimestamp(window.windowEnd, 'windowEnd');
+      return this.db.prepare(`
+        SELECT c.*, r.status AS run_status, r.report_type AS owner_report_type,
+               r.manifest_sealed_at, r.lease_expires_at, r.last_error
+        FROM summary_run_coverage c
+        JOIN summary_runs r ON r.id = c.run_id
+        WHERE c.chat_id = ? AND c.report_type = ?
+          AND c.window_start = ? AND c.window_end = ?
+      `).get(id, type, start, end) || null;
+    });
   }
 
   addPart(input) {
@@ -155,6 +318,32 @@ class SummaryRepository {
     return this.db.prepare(`
       SELECT * FROM summary_run_parts WHERE run_id = ? ORDER BY part_index
     `).all(requireInteger(runId, 'runId', { min: 1 }));
+  }
+
+  persistManifest(runId, contents, now, partUidFactory = null) {
+    const id = requireInteger(runId, 'runId', { min: 1 });
+    const timestamp = requireTimestamp(now, 'now');
+    if (!Array.isArray(contents) || contents.length === 0) {
+      throw new TypeError('contents must contain at least one summary part');
+    }
+    return immediate(this.db, () => {
+      const run = this.findById(id);
+      if (!run) return null;
+      if (run.manifest_sealed_at !== null) {
+        return { run, parts: this.listParts(id), created: false };
+      }
+      for (let index = 0; index < contents.length; index += 1) {
+        this.addPart({
+          partUid: partUidFactory ? partUidFactory(index) : `${run.run_uid}-part-${index + 1}`,
+          runId: id,
+          partIndex: index,
+          content: contents[index],
+          now: timestamp,
+        });
+      }
+      const sealed = this.seal(id, timestamp);
+      return { run: sealed, parts: this.listParts(id), created: true };
+    });
   }
 
   seal(runId, now) {
@@ -298,4 +487,9 @@ class SummaryRepository {
   }
 }
 
-module.exports = { DEFAULT_LEASE_MS, REPORT_TYPES, SummaryRepository };
+module.exports = {
+  AUTOMATIC_REPORT_TYPES,
+  DEFAULT_LEASE_MS,
+  REPORT_TYPES,
+  SummaryRepository,
+};

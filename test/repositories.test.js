@@ -80,7 +80,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
     'attachment_processing_attempts', 'attachments', 'chats', 'issue_events',
     'issue_replies', 'issue_source_snapshots', 'issues', 'jid_aliases', 'messages', 'permission_roles',
     'permissions', 'reply_match_candidates', 'reply_match_sessions', 'sequences',
-    'summary_run_parts', 'summary_runs',
+    'summary_run_coverage', 'summary_run_parts', 'summary_runs',
   ];
   const tables = db.prepare(`
     SELECT name FROM sqlite_schema
@@ -89,7 +89,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   `).all().map((row) => row.name);
   for (const table of expectedTables) assert.ok(tables.includes(table), `${table} should exist`);
   assert.ok(tables.includes('issue_fts'));
-  assert.equal(db.pragma('user_version', { simple: true }), 10);
+  assert.equal(db.pragma('user_version', { simple: true }), 11);
   assert.ok(db.prepare(
     "SELECT 1 FROM sqlite_schema WHERE type='index' AND name='issue_events_chat_time_idx'"
   ).get());

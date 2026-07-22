@@ -42,6 +42,13 @@ function safeDisplayLine(value, options = {}) {
   return safe || fallback;
 }
 
+// Session tokens are generated URL-safe credentials. Preserve `_` and `-`
+// exactly so displayed confirmation commands remain copyable.
+function safeSessionToken(value) {
+  const token = String(value ?? '').trim();
+  return /^[A-Za-z0-9_-]{12,128}$/u.test(token) ? token : 'INVALID_TOKEN';
+}
+
 /**
  * Preserve readable multiline evidence while fencing every untrusted line so
  * it cannot masquerade as another ticket, status, or timeline record.
@@ -319,19 +326,19 @@ function formatReplySuggestion(result) {
   }
   lines.push(
     '',
-    `会话 token：${safeDisplayLine(session.token)}`,
+    `会话 token：${safeSessionToken(session.token)}`,
     `有效至：${formatTimestamp(session.expires_at)}`,
     'token 是短时一次性确认凭据；明文显示仅用于发送失败或重启后的恢复，到期即失效。',
     '确认（推荐携带 token）：',
-    `!pm confirm-reply ${safeDisplayLine(session.token)} ${safeDisplayLine(session.ai_selected_public_id || candidates[0]?.public_id || 'TVn')}`,
+    `!pm confirm-reply ${safeSessionToken(session.token)} ${safeDisplayLine(session.ai_selected_public_id || candidates[0]?.public_id || 'TVn')}`,
     '也可引用本条 Bot 建议，仅发送：!pm confirm-reply TVn',
-    `取消：!pm cancel ${safeDisplayLine(session.token)}（或引用本条发送 !pm cancel）`
+    `取消：!pm cancel ${safeSessionToken(session.token)}（或引用本条发送 !pm cancel）`
   );
   return lines.join('\n');
 }
 
 function formatReplyAlreadyPrompted(result) {
-  return `ℹ️ 此 Tevau 回复已有待确认会话，未重复调用 AI。\ntoken：${safeDisplayLine(result.session.token)}\n请使用：!pm confirm-reply ${safeDisplayLine(result.session.token)} TVn`;
+  return `ℹ️ 此 Tevau 回复已有待确认会话，未重复调用 AI。\ntoken：${safeSessionToken(result.session.token)}\n请使用：!pm confirm-reply ${safeSessionToken(result.session.token)} TVn`;
 }
 
 function formatReplyConfirmed(result) {
@@ -351,7 +358,7 @@ function formatReplyConfirmed(result) {
 }
 
 function formatReplyCancelled(result) {
-  return `✅ 已取消回复匹配会话 ${safeDisplayLine(result.session.token)}${result.session.replayed ? '（已取消）' : ''}；未写入任何工单回复。`;
+  return `✅ 已取消回复匹配会话 ${safeSessionToken(result.session.token)}${result.session.replayed ? '（已取消）' : ''}；未写入任何工单回复。`;
 }
 
 function formatMutationSuccess(operation, result) {
