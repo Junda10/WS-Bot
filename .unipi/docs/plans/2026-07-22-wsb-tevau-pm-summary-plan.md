@@ -40,7 +40,7 @@ specs:
     3. 更新 `.env.example`、`.gitignore` 和 README 的运行时要求。
     4. 增加配置单元测试，覆盖有效、缺失和非法值。
 
-- unstarted: Task 2 — 建立 SQLite 连接、migration 与诊断工具
+- completed: Task 2 — 建立 SQLite 连接、migration 与诊断工具
   - Description: 使用 `better-sqlite3` 创建单例连接、事务边界、PRAGMA、按序 migration 和数据库健康检查。
   - Dependencies: Task 1
   - Acceptance Criteria:

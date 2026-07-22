@@ -4,11 +4,27 @@ const qrcode = require('qrcode-terminal');
 const cron = require('node-cron');
 const axios = require('axios');
 const config = require('./config');
+const { getDatabase, closeDatabase } = require('./db/connection');
+const { migrateDatabase } = require('./db/migrate');
 
 try {
   config.assertValid();
 } catch (error) {
   console.error(`❌ ${error.message}`);
+  process.exit(1);
+}
+
+let database;
+try {
+  database = getDatabase({
+    filename: config.database.path,
+    busyTimeoutMs: config.database.busyTimeoutMs,
+  });
+  const migrationResult = migrateDatabase(database);
+  console.log(`🗄️ SQLite ready (schema version ${migrationResult.currentVersion})`);
+} catch (error) {
+  closeDatabase(database);
+  console.error(`❌ Startup database migration failed: ${error.message}`);
   process.exit(1);
 }
 
@@ -788,4 +804,35 @@ async function sendFxUpdate() {
   }
 }
 
-client.initialize();
+let shuttingDown = false;
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`🛑 ${signal} received, shutting down...`);
+
+  if (reinitTimer) {
+    clearTimeout(reinitTimer);
+    reinitTimer = null;
+  }
+
+  // Close the synchronous database first so it is never left open while the
+  // asynchronous WhatsApp/Puppeteer teardown is waiting.
+  closeDatabase(database);
+  try {
+    await client.destroy();
+  } catch (error) {
+    console.warn(`WhatsApp client shutdown failed: ${error.message}`);
+  }
+  process.exit(0);
+}
+
+process.once('SIGINT', () => shutdown('SIGINT'));
+process.once('SIGTERM', () => shutdown('SIGTERM'));
+process.once('exit', () => closeDatabase(database));
+
+// Database migration above must succeed before WhatsApp can initialize or emit ready.
+client.initialize().catch((error) => {
+  console.error(`WhatsApp initialization failed: ${error.message}`);
+  closeDatabase(database);
+  process.exitCode = 1;
+});
