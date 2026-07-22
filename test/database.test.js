@@ -207,6 +207,105 @@ test('project migration 005 preserves transport MIME only as declared provenance
   assert.deepEqual(db.pragma('foreign_key_check'), []);
 });
 
+test('project migration 007 backfills only eligible v6 image/scanned-PDF history', (t) => {
+  const fixture = makeFixture(t);
+  const projectMigrations = path.join(__dirname, '..', 'db', 'migrations');
+  const throughSix = [
+    '001_database_baseline.sql',
+    '002_pm_domain_schema.sql',
+    '003_durable_message_ingress.sql',
+    '004_message_sender_display_name.sql',
+    '005_secure_attachment_pipeline.sql',
+    '006_attachment_text_extraction.sql',
+  ];
+  for (const name of throughSix) {
+    fs.copyFileSync(path.join(projectMigrations, name), path.join(fixture.migrationsDir, name));
+  }
+  const db = openFixture(t, fixture);
+  migrateDatabase(db, { migrationsDir: fixture.migrationsDir, now: () => 1 });
+  db.exec(`
+    INSERT INTO chats (chat_uid, jid, timezone, created_at, updated_at)
+    VALUES ('ocr-upgrade-chat', '120300000000000000@g.us', 'UTC', 10, 10);
+    INSERT INTO messages (
+      message_uid, whatsapp_message_id, chat_id, sender_jid, body,
+      sent_at, received_at, created_at
+    ) VALUES ('ocr-upgrade-message', 'ocr-upgrade-message', 1, '601@c.us', 'history', 20, 20, 20);
+    INSERT INTO attachment_blobs (
+      sha256, storage_key, size_bytes, retention_class, created_at, updated_at
+    ) VALUES
+      ('${'a'.repeat(64)}', 'temporary/a.jpg', 10, 'TEMPORARY', 20, 20),
+      ('${'b'.repeat(64)}', 'temporary/b.pdf', 10, 'TEMPORARY', 20, 20),
+      ('${'c'.repeat(64)}', 'temporary/c.jpg', 10, 'TEMPORARY', 20, 20),
+      ('${'d'.repeat(64)}', 'temporary/d.png', 10, 'TEMPORARY', 20, 20);
+    INSERT INTO attachments (
+      attachment_uid, idempotency_key, chat_id, message_id, message_chat_id,
+      source_whatsapp_message_id, display_name, size_bytes, sha256,
+      retention_class, processing_status, extracted_text, parse_error,
+      created_at, updated_at, deleted_at, detected_extension, blob_sha256,
+      last_error_code, retryable, parse_status, extracted_char_count,
+      extraction_truncated, archived_at
+    ) VALUES
+      ('historical-image', 'historical-image', 1, 1, 1,
+       'ocr-upgrade-message', 'old.jpg', 10, '${'a'.repeat(64)}',
+       'TEMPORARY', 'UNPARSED', NULL, 'old image parser state',
+       20, 25, NULL, 'jpg', '${'a'.repeat(64)}', 'OLD_IMAGE_ERROR', 0,
+       'NOT_APPLICABLE', NULL, 0, 30),
+      ('scanned-pdf', 'scanned-pdf', 1, 1, 1,
+       'ocr-upgrade-message', 'scan.pdf', 10, '${'b'.repeat(64)}',
+       'TEMPORARY', 'UNPARSED', NULL, 'OCR required',
+       20, 25, NULL, 'pdf', '${'b'.repeat(64)}', 'PDF_NEEDS_OCR', 0,
+       'NEEDS_OCR', NULL, 0, 30),
+      ('parsed-image', 'parsed-image', 1, 1, 1,
+       'ocr-upgrade-message', 'parsed.jpg', 10, '${'c'.repeat(64)}',
+       'TEMPORARY', 'READY', 'durable evidence', NULL,
+       20, 25, NULL, 'jpg', '${'c'.repeat(64)}', NULL, 0,
+       'PARSED', length('durable evidence'), 0, 30),
+      ('deleted-image', 'deleted-image', 1, 1, 1,
+       'ocr-upgrade-message', 'deleted.png', 10, '${'d'.repeat(64)}',
+       'TEMPORARY', 'UNPARSED', NULL, 'historical deleted state',
+       20, 25, 40, 'png', '${'d'.repeat(64)}', 'DELETED_ERROR', 0,
+       'NOT_APPLICABLE', NULL, 0, 30);
+  `);
+
+  fs.copyFileSync(
+    path.join(projectMigrations, '007_attachment_ocr_lifecycle.sql'),
+    path.join(fixture.migrationsDir, '007_attachment_ocr_lifecycle.sql')
+  );
+  assert.deepEqual(migrateDatabase(db, {
+    migrationsDir: fixture.migrationsDir, now: () => 2,
+  }), { applied: [7], currentVersion: 7 });
+  const rows = db.prepare(`
+    SELECT attachment_uid, processing_status, parse_status, retryable,
+           parse_error, last_error_code, updated_at, extraction_metadata_json
+    FROM attachments ORDER BY id
+  `).all();
+  assert.deepEqual(rows, [
+    {
+      attachment_uid: 'historical-image', processing_status: 'UNPARSED',
+      parse_status: 'PENDING', retryable: 1, parse_error: null,
+      last_error_code: null, updated_at: 30, extraction_metadata_json: null,
+    },
+    {
+      attachment_uid: 'scanned-pdf', processing_status: 'UNPARSED',
+      parse_status: 'NEEDS_OCR', retryable: 1, parse_error: 'OCR required',
+      last_error_code: 'PDF_NEEDS_OCR', updated_at: 25, extraction_metadata_json: null,
+    },
+    {
+      attachment_uid: 'parsed-image', processing_status: 'READY',
+      parse_status: 'PARSED', retryable: 0, parse_error: null,
+      last_error_code: null, updated_at: 25, extraction_metadata_json: null,
+    },
+    {
+      attachment_uid: 'deleted-image', processing_status: 'UNPARSED',
+      parse_status: 'NOT_APPLICABLE', retryable: 0,
+      parse_error: 'historical deleted state', last_error_code: 'DELETED_ERROR',
+      updated_at: 25, extraction_metadata_json: null,
+    },
+  ]);
+  assert.deepEqual(db.pragma('integrity_check'), [{ integrity_check: 'ok' }]);
+  assert.deepEqual(db.pragma('foreign_key_check'), []);
+});
+
 test('production PRAGMAs and private POSIX permissions are effective on disk', (t) => {
   const fixture = makeFixture(t);
   const db = openFixture(t, fixture);

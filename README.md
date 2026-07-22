@@ -97,12 +97,29 @@ PM features are restricted by WhatsApp JID, never display name. Set all three id
 | `PM_MAX_FILE_MB` | Maximum attachment size | `20` |
 | `PM_MESSAGE_RETENTION_DAYS` | Ordinary message retention | `30` |
 | `PM_TIMEZONE` / `PM_REPORT_RECOVERY_HOURS` | Report timezone and startup catch-up window | `Asia/Kuala_Lumpur` / `24` |
-| `PM_OCR_ENABLED` / `PM_OCR_LANGUAGES` | Local OCR switch and languages | `true` / `eng+chi_sim` |
+| `PM_OCR_ENABLED` / `PM_OCR_LANGUAGES` | Local OCR switch and languages | `false` / `eng+chi_sim` |
 | `PM_VISION_POLICY` | `off`, `ocr-only`, `ocr-first`, or `vision-first` | `ocr-first` |
 | `PM_BACKUP_DIR` / `PM_BACKUP_RETENTION_COUNT` | Local snapshot directory and count | `data/backups` / `14` |
 | `PM_BACKUP_REMOTE_URL` | Optional off-host backup destination | unset |
 
 Runtime databases (including WAL/SHM files), attachments, temporary files, backups, and OCR data are ignored by Git. Never commit the real `.env`.
+
+#### Local OCR setup (optional)
+
+OCR is **disabled by default**. Image/scanned-PDF attachments are still archived and end in terminal `NEEDS_OCR` state without a recovery loop. To enable offline OCR:
+
+1. Create `data/tessdata/` (or set `PM_OCR_LANG_PATH`).
+2. Install both `eng.traineddata.gz` and `chi_sim.traineddata.gz` there. Do not commit these files.
+3. Set `PM_OCR_ENABLED=true`, `PM_OCR_LANGUAGES=eng+chi_sim`, and restart the bot.
+
+The worker uses a read-only local language/cache configuration and has independent initialization, recognition, image-decode, PDF-page-render, termination, and shutdown limits. Missing or bad traineddata is returned as a retryable OCR failure; it cannot use Tesseract's throwing default error handler. Tune density/resource thresholds using the documented `PM_OCR_*` values in `.env.example`. `PM_MAX_IMAGE_PIXELS` defaults to 40 million and cannot exceed 100 million.
+
+The normal suite is network-free and uses fake OCR workers. An optional real smoke requires the local English and Simplified Chinese data above:
+
+```bash
+npm run ocr:smoke -- --expect "known substring" ./sample-eng-chi.png
+# or set PM_OCR_SMOKE_EXPECT
+```
 
 ### Clarification (ask-user threshold) module
 

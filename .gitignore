@@ -33,7 +33,11 @@ tmp/
 temp/
 backups/
 ocr-data/
+ocr-cache/
+.tesseract-cache/
 tessdata/
+*.traineddata
+*.traineddata.gz
 
 # Generated user websites
 sites/

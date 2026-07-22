@@ -326,9 +326,10 @@ class AttachmentService {
     if (!attachment?.blob_sha256 || !attachment.storage_key) {
       throw new AttachmentProcessingError('ATTACHMENT_UNAVAILABLE', 'Archived attachment bytes are unavailable');
     }
-    const kind = input.kind || ({ md: 'markdown', txt: 'text', pdf: 'pdf', docx: 'docx' })[
-      attachment.detected_extension
-    ];
+    const kind = input.kind || ({
+      md: 'markdown', txt: 'text', pdf: 'pdf', docx: 'docx',
+      jpg: 'jpeg', jpeg: 'jpeg', png: 'png', gif: 'gif', webp: 'webp', bmp: 'bmp',
+    })[attachment.detected_extension];
     if (!EXTRACTABLE_KINDS.has(kind)) return { attachment, extraction: null, attempt: null };
 
     const claimId = input.claimId || crypto.randomUUID();
@@ -352,7 +353,7 @@ class AttachmentService {
     const leaseUntil = startedAt + this.limits.processingTimeoutMs + 5000;
     const attempt = this.repositories.attachments.startAttempt({
       attachmentId: attachment.id,
-      operation: 'EXTRACT',
+      operation: ['jpeg', 'png', 'gif', 'webp', 'bmp'].includes(kind) ? 'OCR' : 'EXTRACT',
       claimId,
       leaseUntil,
       idempotencyKey: `attachment:${attachment.id}:extract:${claimId}`,
@@ -372,9 +373,11 @@ class AttachmentService {
     }, this.limits, { signal: input.signal });
     throwIfAborted(input.signal);
     const parsed = extraction.status === 'PARSED';
+    const transientOcrFailure = extraction.status === 'NEEDS_OCR'
+      && extraction.retryable === true;
     const completed = this.repositories.attachments.completeAttempt({
       attemptId: attempt.id,
-      status: 'SUCCEEDED',
+      status: transientOcrFailure ? 'FAILED' : 'SUCCEEDED',
       attachmentStatus: parsed ? 'READY' : 'UNPARSED',
       parseStatus: extraction.status,
       extractedText: extraction.text,
@@ -577,6 +580,11 @@ class AttachmentService {
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = null;
     this.recoveryTimerAt = null;
+  }
+
+  terminate() {
+    this.stopRecovery();
+    return this.extractor.terminate?.() || Promise.resolve();
   }
 
   async _reconcilePromotion(blob) {

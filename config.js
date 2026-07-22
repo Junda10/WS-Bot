@@ -158,8 +158,22 @@ function loadConfig(env = process.env) {
     },
 
     media: {
-      ocrEnabled: readBoolean(env, 'PM_OCR_ENABLED', true),
+      ocrEnabled: readBoolean(env, 'PM_OCR_ENABLED', false),
       ocrLanguages: String(env.PM_OCR_LANGUAGES || 'eng+chi_sim').trim(),
+      maxOcrPdfPages: readInteger(env, 'PM_OCR_MAX_PDF_PAGES', 10),
+      ocrDesiredWidth: readInteger(env, 'PM_OCR_DESIRED_WIDTH', 1800),
+      maxOcrImageBytes: readInteger(env, 'PM_OCR_MAX_IMAGE_MB', 20) * 1024 * 1024,
+      minPdfTextCharsPerPage: readInteger(env, 'PM_OCR_PDF_MIN_TEXT_CHARS', 20),
+      minPdfTextItemsPerPage: readInteger(env, 'PM_OCR_PDF_MIN_TEXT_ITEMS', 2),
+      minPdfMeaningfulCharsPerPage: readInteger(env, 'PM_OCR_PDF_MIN_MEANINGFUL_CHARS', 20),
+      minPdfTextCoverage: readNumber(env, 'PM_OCR_PDF_MIN_TEXT_COVERAGE', 0.005),
+      ocrInitializeTimeoutMs: readInteger(env, 'PM_OCR_INITIALIZE_TIMEOUT_MS', 30_000),
+      ocrRecognizeTimeoutMs: readInteger(env, 'PM_OCR_RECOGNIZE_TIMEOUT_MS', 60_000),
+      ocrShutdownTimeoutMs: readInteger(env, 'PM_OCR_SHUTDOWN_TIMEOUT_MS', 2_000),
+      imagePreprocessTimeoutMs: readInteger(env, 'PM_OCR_IMAGE_PREPROCESS_TIMEOUT_MS', 15_000),
+      pdfOcrRenderTimeoutMs: readInteger(env, 'PM_OCR_PDF_RENDER_TIMEOUT_MS', 120_000),
+      ocrCachePath: path.resolve(root, env.PM_OCR_CACHE_PATH || 'data/ocr-cache'),
+      ocrLangPath: path.resolve(root, env.PM_OCR_LANG_PATH || 'data/tessdata'),
       visionPolicy: String(env.PM_VISION_POLICY || 'ocr-first').trim().toLowerCase(),
     },
 
@@ -240,7 +254,7 @@ function validateConfig(config, { requirePm = true } = {}) {
   integerInRange(config.storage.maxPdfTextItems, 1, 100_000_000, 'PM_MAX_PDF_TEXT_ITEMS');
   integerInRange(config.storage.maxExtractedItems, 1, 100_000_000, 'PM_MAX_EXTRACTED_ITEMS');
   integerInRange(config.storage.parserMaxOldSpaceMb, 16, 2048, 'PM_PARSER_MAX_OLD_SPACE_MB');
-  integerInRange(config.storage.maxImagePixels, 1, 1_000_000_000, 'PM_MAX_IMAGE_PIXELS');
+  integerInRange(config.storage.maxImagePixels, 1, 100_000_000, 'PM_MAX_IMAGE_PIXELS');
   if (!Number.isSafeInteger(config.storage.maxDocxUncompressedBytes)
       || config.storage.maxDocxUncompressedBytes < 1024 * 1024
       || config.storage.maxDocxUncompressedBytes > 10 * 1024 * 1024 * 1024) {
@@ -265,7 +279,61 @@ function validateConfig(config, { requirePm = true } = {}) {
   validTimezone(config.reports.timezone, 'PM_TIMEZONE');
   integerInRange(config.reports.recoveryWindowHours, 1, 168, 'PM_REPORT_RECOVERY_HOURS');
   validBoolean(config.media.ocrEnabled, 'PM_OCR_ENABLED');
-  if (!config.media.ocrLanguages) errors.push('PM_OCR_LANGUAGES must not be empty');
+  if (!/^[a-z0-9_]+(?:\+[a-z0-9_]+)*$/u.test(config.media.ocrLanguages)
+      || config.media.ocrLanguages.split('+').length > 8) {
+    errors.push('PM_OCR_LANGUAGES must contain 1-8 plus-separated Tesseract language codes');
+  }
+  integerInRange(config.media.maxOcrPdfPages, 1, 1000, 'PM_OCR_MAX_PDF_PAGES');
+  integerInRange(config.media.ocrDesiredWidth, 320, 5000, 'PM_OCR_DESIRED_WIDTH');
+  if (!Number.isSafeInteger(config.media.maxOcrImageBytes)
+      || config.media.maxOcrImageBytes < 1024 * 1024
+      || config.media.maxOcrImageBytes > 100 * 1024 * 1024) {
+    errors.push('PM_OCR_MAX_IMAGE_MB must be an integer from 1 to 100');
+  }
+  integerInRange(config.media.minPdfTextCharsPerPage, 1, 10000, 'PM_OCR_PDF_MIN_TEXT_CHARS');
+  integerInRange(config.media.minPdfTextItemsPerPage, 1, 1000, 'PM_OCR_PDF_MIN_TEXT_ITEMS');
+  integerInRange(
+    config.media.minPdfMeaningfulCharsPerPage,
+    1,
+    10000,
+    'PM_OCR_PDF_MIN_MEANINGFUL_CHARS'
+  );
+  if (!Number.isFinite(config.media.minPdfTextCoverage)
+      || config.media.minPdfTextCoverage <= 0 || config.media.minPdfTextCoverage > 0.25) {
+    errors.push('PM_OCR_PDF_MIN_TEXT_COVERAGE must be greater than 0 and at most 0.25');
+  }
+  integerInRange(
+    config.media.ocrInitializeTimeoutMs,
+    1000,
+    60 * 60 * 1000,
+    'PM_OCR_INITIALIZE_TIMEOUT_MS'
+  );
+  integerInRange(
+    config.media.ocrRecognizeTimeoutMs,
+    1000,
+    60 * 60 * 1000,
+    'PM_OCR_RECOGNIZE_TIMEOUT_MS'
+  );
+  integerInRange(
+    config.media.ocrShutdownTimeoutMs,
+    100,
+    60_000,
+    'PM_OCR_SHUTDOWN_TIMEOUT_MS'
+  );
+  integerInRange(
+    config.media.imagePreprocessTimeoutMs,
+    1000,
+    60 * 60 * 1000,
+    'PM_OCR_IMAGE_PREPROCESS_TIMEOUT_MS'
+  );
+  integerInRange(
+    config.media.pdfOcrRenderTimeoutMs,
+    1000,
+    60 * 60 * 1000,
+    'PM_OCR_PDF_RENDER_TIMEOUT_MS'
+  );
+  if (!config.media.ocrCachePath) errors.push('PM_OCR_CACHE_PATH must not be empty');
+  if (!config.media.ocrLangPath) errors.push('PM_OCR_LANG_PATH must not be empty');
   if (!VISION_POLICIES.has(config.media.visionPolicy)) {
     errors.push(`PM_VISION_POLICY must be one of: ${[...VISION_POLICIES].join(', ')}`);
   }

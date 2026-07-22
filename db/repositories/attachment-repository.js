@@ -258,8 +258,10 @@ class AttachmentRepository {
           AND a.retryable = 1 AND a.processing_claim_id IS NULL
           AND (
             (a.blob_sha256 IS NOT NULL
-              AND a.parse_status IN ('PENDING', 'FAILED')
-              AND a.detected_extension IN ('md', 'txt', 'pdf', 'docx'))
+              AND a.parse_status IN ('PENDING', 'FAILED', 'NEEDS_OCR')
+              AND a.detected_extension IN (
+                'md', 'txt', 'pdf', 'docx', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'
+              ))
             OR
             (a.blob_sha256 IS NULL
               AND a.processing_status IN ('PENDING', 'FAILED')
@@ -289,7 +291,8 @@ class AttachmentRepository {
         && (current.processing_lease_until === null || current.processing_lease_until <= now);
       const eligible = current.processing_status === 'FAILED'
         || (current.processing_status === 'PENDING' && current.processing_claim_id === null)
-        || (current.processing_status === 'UNPARSED' && current.parse_status === 'PENDING'
+        || (current.processing_status === 'UNPARSED'
+          && ['PENDING', 'NEEDS_OCR'].includes(current.parse_status)
           && current.processing_claim_id === null)
         || stale;
       if (!eligible) return null;
@@ -307,7 +310,7 @@ class AttachmentRepository {
         SET processing_status = CASE WHEN blob_sha256 IS NULL THEN 'PENDING' ELSE 'UNPARSED' END,
             parse_status = CASE
               WHEN blob_sha256 IS NULL THEN NULL
-              WHEN parse_status IN ('FAILED', 'PARSING') THEN 'PENDING'
+              WHEN parse_status IN ('FAILED', 'PARSING', 'NEEDS_OCR') THEN 'PENDING'
               ELSE parse_status
             END,
             extracted_text = CASE WHEN parse_status = 'PARSED' THEN extracted_text ELSE NULL END,
@@ -315,6 +318,8 @@ class AttachmentRepository {
             extraction_truncated = CASE WHEN parse_status = 'PARSED' THEN extraction_truncated ELSE 0 END,
             retryable = 1, processing_claim_id = @claimId,
             processing_lease_until = NULL, parse_error = NULL,
+            extraction_metadata_json = CASE WHEN parse_status = 'PARSED'
+              THEN extraction_metadata_json ELSE NULL END,
             last_error_code = NULL, updated_at = @now
         WHERE id = @attachmentId AND deleted_at IS NULL
         RETURNING *
@@ -428,12 +433,12 @@ class AttachmentRepository {
           SET processing_status = CASE WHEN blob_sha256 IS NULL THEN 'PENDING' ELSE 'UNPARSED' END,
               parse_status = CASE
                 WHEN blob_sha256 IS NULL THEN NULL
-                WHEN @operation = 'EXTRACT' THEN 'PENDING'
+                WHEN @operation IN ('EXTRACT', 'OCR') THEN 'PENDING'
                 ELSE parse_status
               END,
-              extracted_text = CASE WHEN @operation = 'EXTRACT' THEN NULL ELSE extracted_text END,
-              extracted_char_count = CASE WHEN @operation = 'EXTRACT' THEN NULL ELSE extracted_char_count END,
-              extraction_truncated = CASE WHEN @operation = 'EXTRACT' THEN 0 ELSE extraction_truncated END,
+              extracted_text = CASE WHEN @operation IN ('EXTRACT', 'OCR') THEN NULL ELSE extracted_text END,
+              extracted_char_count = CASE WHEN @operation IN ('EXTRACT', 'OCR') THEN NULL ELSE extracted_char_count END,
+              extraction_truncated = CASE WHEN @operation IN ('EXTRACT', 'OCR') THEN 0 ELSE extraction_truncated END,
               processing_claim_id = @claimId,
               processing_lease_until = NULL, retryable = 1, updated_at = @now
           WHERE id = @attachmentId AND deleted_at IS NULL
@@ -444,7 +449,7 @@ class AttachmentRepository {
         UPDATE attachments
         SET next_attempt_number = next_attempt_number + 1,
             processing_status = 'PROCESSING',
-            parse_status = CASE WHEN @operation = 'EXTRACT' THEN 'PARSING' ELSE parse_status END,
+            parse_status = CASE WHEN @operation IN ('EXTRACT', 'OCR') THEN 'PARSING' ELSE parse_status END,
             parse_error = NULL, last_error_code = NULL,
             processing_lease_until = @leaseUntil, updated_at = @now
         WHERE id = @attachmentId AND deleted_at IS NULL
@@ -486,12 +491,24 @@ class AttachmentRepository {
       });
       if (!attempt) throw new Error('Attachment attempt is not active');
 
+      const extractionOperation = ['EXTRACT', 'OCR'].includes(attempt.operation);
+      const preservesNeedsOcr = status === 'FAILED'
+        && extractionOperation
+        && input.attachmentStatus === 'UNPARSED'
+        && input.parseStatus === 'NEEDS_OCR';
+      if (status === 'FAILED'
+          && (input.attachmentStatus != null || input.parseStatus != null)
+          && !preservesNeedsOcr) {
+        throw new TypeError(
+          'A failed attempt may preserve only UNPARSED/NEEDS_OCR extraction state'
+        );
+      }
       const attachmentStatus = status === 'SUCCEEDED'
         ? enumValue(input.attachmentStatus || 'READY', 'attachmentStatus', PROCESSING_STATUSES)
-        : 'FAILED';
-      const parseStatus = attempt.operation === 'EXTRACT'
+        : (preservesNeedsOcr ? 'UNPARSED' : 'FAILED');
+      const parseStatus = extractionOperation
         ? (status === 'FAILED'
-          ? 'FAILED'
+          ? (preservesNeedsOcr ? 'NEEDS_OCR' : 'FAILED')
           : enumValue(input.parseStatus || 'PARSED', 'parseStatus', PARSE_STATUSES))
         : null;
       const retryable = status === 'FAILED'
@@ -514,6 +531,7 @@ class AttachmentRepository {
             extracted_char_count = CASE WHEN @parseStatus = 'PARSED' THEN length(@extractedText) ELSE NULL END,
             extraction_truncated = CASE WHEN @parseStatus = 'PARSED' THEN @truncated ELSE 0 END,
             parse_error = @parseError, last_error_code = @errorCode,
+            extraction_metadata_json = @metadataJson,
             retryable = @retryable, processing_claim_id = NULL,
             processing_lease_until = NULL, updated_at = @now
         WHERE id = @attachmentId AND processing_claim_id = @claimId RETURNING *
@@ -530,6 +548,7 @@ class AttachmentRepository {
         errorCode: (status === 'FAILED' || input.errorCode != null)
           ? (optionalString(input.errorCode, 'errorCode', { max: 100 }) || 'PROCESSING_FAILED')
           : null,
+        metadataJson: input.metadata == null ? null : JSON.stringify(input.metadata),
         retryable,
         now,
       });
@@ -653,10 +672,12 @@ class AttachmentRepository {
             sha256 = @sha256, blob_sha256 = @sha256, storage_key = NULL,
             duplicate_of_attachment_id = NULL, downloaded_at = @now,
             archived_at = @now, processing_status = 'UNPARSED',
-            parse_status = CASE WHEN @detectedExtension IN ('md', 'txt', 'pdf', 'docx')
-              THEN 'PENDING' ELSE 'NOT_APPLICABLE' END,
-            retryable = CASE WHEN @detectedExtension IN ('md', 'txt', 'pdf', 'docx')
-              THEN 1 ELSE 0 END,
+            parse_status = CASE WHEN @detectedExtension IN (
+              'md', 'txt', 'pdf', 'docx', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'
+            ) THEN 'PENDING' ELSE 'NOT_APPLICABLE' END,
+            retryable = CASE WHEN @detectedExtension IN (
+              'md', 'txt', 'pdf', 'docx', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'
+            ) THEN 1 ELSE 0 END,
             processing_claim_id = NULL, processing_lease_until = NULL,
             updated_at = @now
         WHERE id = @attachmentId AND deleted_at IS NULL RETURNING *
@@ -685,10 +706,12 @@ class AttachmentRepository {
           sha256 = @sha256, blob_sha256 = @sha256, storage_key = NULL,
           duplicate_of_attachment_id = @duplicateOfAttachmentId,
           downloaded_at = @now, archived_at = @now, processing_status = 'UNPARSED',
-          parse_status = CASE WHEN @detectedExtension IN ('md', 'txt', 'pdf', 'docx')
-            THEN 'PENDING' ELSE 'NOT_APPLICABLE' END,
-          retryable = CASE WHEN @detectedExtension IN ('md', 'txt', 'pdf', 'docx')
-            THEN 1 ELSE 0 END,
+          parse_status = CASE WHEN @detectedExtension IN (
+            'md', 'txt', 'pdf', 'docx', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'
+          ) THEN 'PENDING' ELSE 'NOT_APPLICABLE' END,
+          retryable = CASE WHEN @detectedExtension IN (
+            'md', 'txt', 'pdf', 'docx', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'
+          ) THEN 1 ELSE 0 END,
           processing_claim_id = NULL, processing_lease_until = NULL,
           updated_at = @now
       WHERE id = @attachmentId AND deleted_at IS NULL RETURNING *

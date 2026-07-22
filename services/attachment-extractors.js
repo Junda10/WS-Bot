@@ -5,7 +5,8 @@ const { TextDecoder } = require('util');
 const mammoth = require('mammoth');
 const { inspectDocxZip, sanitizeDisplayName } = require('./attachment-type');
 
-const EXTRACTABLE_KINDS = new Set(['markdown', 'text', 'pdf', 'docx']);
+const IMAGE_KINDS = new Set(['jpeg', 'png', 'gif', 'webp', 'bmp']);
+const EXTRACTABLE_KINDS = new Set(['markdown', 'text', 'pdf', 'docx', ...IMAGE_KINDS]);
 const UNSAFE_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\p{Cf}]/u;
 const UNPAIRED_SURROGATE = /[\uD800-\uDFFF]/u;
 const BEGIN_BOUNDARY = '--- BEGIN UNTRUSTED ATTACHMENT EVIDENCE ---';
@@ -31,13 +32,35 @@ function validateLimits(limits = {}) {
     maxDocxUncompressedBytes: limits.maxDocxUncompressedBytes ?? 100 * 1024 * 1024,
     maxDocxCompressionRatio: limits.maxDocxCompressionRatio ?? 100,
     maxZipEntries: limits.maxZipEntries ?? 10_000,
+    minPdfTextCharsPerPage: limits.minPdfTextCharsPerPage ?? 20,
+    minPdfTextItemsPerPage: limits.minPdfTextItemsPerPage ?? 2,
+    minPdfMeaningfulCharsPerPage: limits.minPdfMeaningfulCharsPerPage ?? 20,
+    maxOcrPdfPages: limits.maxOcrPdfPages ?? 10,
+    ocrDesiredWidth: limits.ocrDesiredWidth ?? 1800,
+    maxOcrImageBytes: limits.maxOcrImageBytes ?? 20 * 1024 * 1024,
+    ocrRecognizeTimeoutMs: limits.ocrRecognizeTimeoutMs ?? 60_000,
+    imagePreprocessTimeoutMs: limits.imagePreprocessTimeoutMs ?? 15_000,
+    pdfOcrRenderTimeoutMs: limits.pdfOcrRenderTimeoutMs ?? 120_000,
   };
   for (const [name, value] of Object.entries(resolved)) {
     if (!Number.isSafeInteger(value) || value < 1) {
       throw new TypeError(`${name} must be a positive safe integer`);
     }
   }
+  const minPdfTextCoverage = limits.minPdfTextCoverage ?? 0.005;
+  if (!Number.isFinite(minPdfTextCoverage)
+      || minPdfTextCoverage <= 0 || minPdfTextCoverage > 0.25) {
+    throw new TypeError('minPdfTextCoverage must be a number greater than 0 and at most 0.25');
+  }
+  resolved.minPdfTextCoverage = minPdfTextCoverage;
   return Object.freeze(resolved);
+}
+
+function pdfPageNeedsOcr(metrics = {}, limits = {}) {
+  return metrics.textChars < (limits.minPdfTextCharsPerPage ?? 20)
+    || metrics.textItemCount < (limits.minPdfTextItemsPerPage ?? 2)
+    || metrics.meaningfulChars < (limits.minPdfMeaningfulCharsPerPage ?? 20)
+    || metrics.textCoverage < (limits.minPdfTextCoverage ?? 0.005);
 }
 
 function canonicalizeExtractedText(value, options = {}) {
@@ -278,7 +301,9 @@ module.exports = {
   BEGIN_BOUNDARY,
   END_BOUNDARY,
   EXTRACTABLE_KINDS,
+  IMAGE_KINDS,
   canonicalizeExtractedText,
+  pdfPageNeedsOcr,
   extractAttachmentFile,
   frameEvidence,
   markdownToStructuredPlainText,

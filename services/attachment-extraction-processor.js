@@ -4,7 +4,13 @@ const fs = require('fs');
 const path = require('path');
 const { fork } = require('child_process');
 const { Worker } = require('worker_threads');
-const { AttachmentExtractionError } = require('./attachment-extractors');
+const {
+  AttachmentExtractionError,
+  IMAGE_KINDS,
+  frameEvidence,
+  savedUnparsed,
+} = require('./attachment-extractors');
+const { PdfOcrRenderer } = require('./attachment-pdf-ocr-renderer');
 
 class AttachmentExtractionProcessor {
   constructor(options = {}) {
@@ -12,6 +18,13 @@ class AttachmentExtractionProcessor {
     this.fork = options.fork || fork;
     this.workerPath = options.workerPath || path.join(__dirname, 'attachment-extraction-worker.js');
     this.pdfChildPath = options.pdfChildPath || path.join(__dirname, 'attachment-pdf-child.js');
+    this.ocr = options.ocrService || null;
+    this.pdfRenderer = options.pdfRenderer || new PdfOcrRenderer({ fork: this.fork });
+    this.pdfTextExtractor = options.pdfTextExtractor || null;
+  }
+
+  terminate() {
+    return this.ocr?.terminate?.() || Promise.resolve();
   }
 
   process(filePath, metadata = {}, limits = {}, options = {}) {
@@ -28,9 +41,10 @@ class AttachmentExtractionProcessor {
       return Promise.reject(error);
     }
     if (options.signal?.aborted) return Promise.reject(this._abortError());
-    return String(metadata.kind || '').toLowerCase() === 'pdf'
-      ? this._processPdf(canonical, metadata, limits, options)
-      : this._processWorker(canonical, metadata, limits, options);
+    const kind = String(metadata.kind || '').toLowerCase();
+    if (kind === 'pdf') return this._processPdf(canonical, metadata, limits, options);
+    if (IMAGE_KINDS.has(kind)) return this._processImage(canonical, metadata, limits, options);
+    return this._processWorker(canonical, metadata, limits, options);
   }
 
   _processWorker(filePath, metadata, limits, options) {
@@ -56,7 +70,146 @@ class AttachmentExtractionProcessor {
     });
   }
 
-  _processPdf(filePath, metadata, limits, options) {
+  async _processImage(filePath, metadata, limits, options) {
+    if (!this.ocr) {
+      return savedUnparsed(
+        'OCR_UNAVAILABLE',
+        'Image was saved but no OCR service is configured',
+        { ocrStatus: 'DISABLED' },
+        'NEEDS_OCR',
+        false
+      );
+    }
+    return this.ocr.extractImage(filePath, metadata, limits, options);
+  }
+
+  async _processPdf(filePath, metadata, limits, options) {
+    const textResult = this.pdfTextExtractor
+      ? await this.pdfTextExtractor(filePath, metadata, limits, options)
+      : await this._processPdfText(filePath, metadata, limits, options);
+    if (textResult.status !== 'NEEDS_OCR' || textResult.errorCode !== 'PDF_NEEDS_OCR') {
+      return textResult;
+    }
+    if (!this.ocr || limits.ocrEnabled === false) {
+      return {
+        ...textResult,
+        errorMessage: 'PDF was saved but OCR is disabled or unavailable',
+        retryable: false,
+        metadata: { ...textResult.metadata, ocrStatus: 'DISABLED' },
+      };
+    }
+
+    const allRequested = Array.isArray(textResult.ocrPageNumbers)
+      ? textResult.ocrPageNumbers : (textResult.metadata?.ocrPageNumbers || []);
+    const maxPages = limits.maxOcrPdfPages ?? 10;
+    const selected = allRequested.slice(0, maxPages);
+    const failedPages = allRequested.slice(maxPages).map((pageNumber) => ({
+      pageNumber,
+      code: 'PDF_OCR_PAGE_LIMIT',
+      message: `OCR page limit ${maxPages} reached`,
+      retryable: false,
+    }));
+    const pageTexts = Array.isArray(textResult.pageTexts) ? textResult.pageTexts : [];
+    let rendered = [];
+    try {
+      rendered = await this.pdfRenderer.renderPages(filePath, selected, limits, {
+        signal: options.signal,
+      });
+    } catch (error) {
+      rendered = error.partialResults || [];
+      const completed = new Set(rendered.map((entry) => entry.pageNumber));
+      for (const pageNumber of selected) {
+        if (!completed.has(pageNumber)) failedPages.push({
+          pageNumber,
+          code: error.code || 'PDF_OCR_RENDER_FAILED',
+          message: String(error.message || error).slice(0, 1000),
+          retryable: error.retryable === true,
+        });
+      }
+    }
+
+    const ocrByPage = new Map();
+    for (const result of rendered) {
+      if (!result.ok || !result.buffer) {
+        failedPages.push({
+          pageNumber: result.pageNumber,
+          code: result.error?.code || 'PDF_OCR_RENDER_FAILED',
+          message: result.error?.message || 'PDF page rendering produced no image',
+          retryable: result.error?.retryable === true,
+        });
+        continue;
+      }
+      try {
+        const value = await this.ocr.recognize(result.buffer, {
+          pdfPageNumber: result.pageNumber,
+          renderedWidth: result.width,
+          renderedHeight: result.height,
+        }, limits, options);
+        if (!value?.text) {
+          failedPages.push({
+            pageNumber: result.pageNumber,
+            code: 'OCR_EMPTY',
+            message: 'OCR found no text on this page',
+            retryable: false,
+          });
+        } else {
+          ocrByPage.set(result.pageNumber, value);
+        }
+      } catch (error) {
+        failedPages.push({
+          pageNumber: result.pageNumber,
+          code: error?.code || 'OCR_PAGE_FAILED',
+          message: String(error?.message || error).slice(0, 1000),
+          retryable: error?.retryable === true,
+        });
+      }
+    }
+
+    const sections = [];
+    const pageCount = textResult.metadata?.pageCount ?? pageTexts.length;
+    for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
+      const ocr = ocrByPage.get(pageNumber);
+      const original = String(pageTexts[pageNumber - 1] || '').trim();
+      const text = ocr?.text || original;
+      if (!text) continue;
+      sections.push(`=== PDF PAGE ${pageNumber} | source=${ocr ? 'OCR' : 'TEXT'} ===\n${text}`);
+    }
+    const succeededPages = [...ocrByPage.keys()].sort((a, b) => a - b);
+    const retryable = failedPages.some((page) => page.retryable === true);
+    const metadataResult = {
+      ...textResult.metadata,
+      adapter: `${textResult.metadata?.adapter || 'pdf-text'}+pdf-parse.getScreenshot+tesseract.js`,
+      ocrStatus: failedPages.length > 0 ? (succeededPages.length > 0 ? 'PARTIAL' : 'NEEDS_OCR') : 'SUCCEEDED',
+      ocrRequestedPages: allRequested,
+      ocrProcessedPages: succeededPages,
+      failedPages,
+      ocrPagesLimited: allRequested.length > selected.length,
+    };
+    delete metadataResult.ocrPageNumbers;
+    // Native headers/footers/noise cannot turn total selected-page OCR failure
+    // into a contradictory PARSED result.
+    if (selected.length > 0 && succeededPages.length === 0) {
+      return savedUnparsed(
+        failedPages.every((page) => page.code === 'OCR_EMPTY') ? 'OCR_EMPTY' : 'PDF_NEEDS_OCR',
+        'PDF was saved but all selected-page OCR attempts failed',
+        metadataResult,
+        'NEEDS_OCR',
+        retryable
+      );
+    }
+    if (sections.length === 0) {
+      return savedUnparsed(
+        'OCR_EMPTY',
+        'PDF was saved but selected-page OCR produced no text',
+        metadataResult,
+        'NEEDS_OCR',
+        false
+      );
+    }
+    return frameEvidence(sections.join('\n\n'), { ...metadata, kind: 'pdf' }, limits, metadataResult);
+  }
+
+  _processPdfText(filePath, metadata, limits, options) {
     const memoryMb = this._memoryLimit(limits);
     const child = this.fork(this.pdfChildPath, [], {
       execArgv: [`--max-old-space-size=${memoryMb}`],

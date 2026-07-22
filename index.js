@@ -13,6 +13,9 @@ const { createDebouncedSmartReplyScheduler } = require('./services/debounced-sma
 const { AttachmentStorage } = require('./services/attachment-storage');
 const { AttachmentProcessingQueue } = require('./services/attachment-processing-queue');
 const { AttachmentService } = require('./services/attachment-service');
+const { AttachmentExtractionProcessor } = require('./services/attachment-extraction-processor');
+const { AttachmentOcrService } = require('./services/attachment-ocr-service');
+const { OcrWorkerService } = require('./services/ocr-worker-service');
 const { WhatsAppAdapter } = require('./whatsapp/adapter');
 const { AuthorizedGroupIngress, createMessageEventHandler } = require('./whatsapp/ingress');
 const { createPmCommandHandlers } = require('./commands/pm-handler');
@@ -131,6 +134,19 @@ const attachmentQueue = new AttachmentProcessingQueue({
   concurrency: 1,
   maxPending: config.storage.maxQueuePending,
 });
+const ocrWorkerService = new OcrWorkerService({
+  languages: config.media.ocrLanguages,
+  cachePath: config.media.ocrCachePath,
+  langPath: config.media.ocrLangPath,
+  timeoutMs: config.media.ocrRecognizeTimeoutMs,
+  initializeTimeoutMs: config.media.ocrInitializeTimeoutMs,
+  shutdownTimeoutMs: config.media.ocrShutdownTimeoutMs,
+  logger: console,
+});
+const attachmentOcrService = new AttachmentOcrService({ worker: ocrWorkerService });
+const attachmentExtractor = new AttachmentExtractionProcessor({
+  ocrService: attachmentOcrService,
+});
 const attachmentService = new AttachmentService({
   repositories,
   permissionService,
@@ -138,7 +154,8 @@ const attachmentService = new AttachmentService({
   storage: attachmentStorage,
   queue: attachmentQueue,
   adapter: whatsappAdapter,
-  limits: config.storage,
+  extractor: attachmentExtractor,
+  limits: { ...config.storage, ...config.media },
   temporaryRetentionDays: config.retention.messageDays,
   clock: appClock,
 });
@@ -1004,6 +1021,11 @@ async function shutdown(signal) {
     }
   } catch (error) {
     console.warn(`WhatsApp ingress drain failed: ${error.message}`);
+  }
+  try {
+    await attachmentService.terminate();
+  } catch (error) {
+    console.warn(`OCR worker shutdown failed: ${error.message}`);
   }
 
   try {

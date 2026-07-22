@@ -156,7 +156,7 @@ specs:
     4. 将普通 Markdown extracted text 接入 message repository 和 summary source query。
     5. 添加 Markdown、PDF、DOCX、编码、损坏和提示注入 fixtures/tests。
 
-- unstarted: Task 10 — 实现图片与扫描 PDF OCR
+- completed: Task 10 — 实现图片与扫描 PDF OCR
   - Description: 使用 Sharp 预处理图片、复用 Tesseract worker，并对低文本密度 PDF 页执行受限 OCR。
   - Dependencies: Tasks 8, 9
   - Acceptance Criteria:

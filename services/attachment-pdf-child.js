@@ -5,6 +5,7 @@ const path = require('path');
 const {
   canonicalizeExtractedText,
   frameEvidence,
+  pdfPageNeedsOcr,
   savedUnparsed,
   validateLimits,
 } = require('./attachment-extractors');
@@ -97,8 +98,11 @@ async function extractPdf(input) {
     let textItems = 0;
     let rawChars = 0;
     let sourceTruncated = false;
-    let sawText = false;
     const pages = [];
+    const pageNonWhitespaceChars = [];
+    const pageTextItemCounts = [];
+    const pageMeaningfulChars = [];
+    const pageTextCoverage = [];
     for (let pageNumber = 1; pageNumber <= pageCount; pageNumber += 1) {
       let page;
       try {
@@ -115,8 +119,14 @@ async function extractPdf(input) {
           );
         }
 
+        const viewport = page.getViewport({ scale: 1 });
+        const pageArea = Math.max(1, Math.abs(viewport.width * viewport.height));
         const lines = [];
         let line = '';
+        let nonWhitespaceChars = 0;
+        let meaningfulChars = 0;
+        let nonEmptyItems = 0;
+        let coveredArea = 0;
         let lastY;
         for (const item of textContent.items) {
           // Marked-content records do not carry text and are excluded above,
@@ -131,7 +141,19 @@ async function extractPdf(input) {
             );
           }
           const value = item.str;
-          if (/\S/u.test(value)) sawText = true;
+          const compact = value.replace(/\s/gu, '');
+          nonWhitespaceChars += compact.length;
+          const meaningful = value.match(/[\p{L}\p{N}]/gu) || [];
+          meaningfulChars += meaningful.length;
+          if (compact.length > 0) {
+            nonEmptyItems += 1;
+            const itemWidth = Math.abs(Number(item.width) || 0);
+            const itemHeight = Math.abs(Number(item.height)
+              || (Array.isArray(item.transform) ? Number(item.transform[3]) : 0) || 0);
+            if (Number.isFinite(itemWidth) && Number.isFinite(itemHeight)) {
+              coveredArea += Math.min(pageArea, itemWidth * itemHeight);
+            }
+          }
           const y = Array.isArray(item.transform) ? item.transform[5] : undefined;
           if (lastY !== undefined && y !== undefined && y !== lastY) {
             lines.push(line);
@@ -147,6 +169,10 @@ async function extractPdf(input) {
         }
         if (line) lines.push(line);
         pages.push(lines.join('\n'));
+        pageNonWhitespaceChars.push(nonWhitespaceChars);
+        pageTextItemCounts.push(nonEmptyItems);
+        pageMeaningfulChars.push(meaningfulChars);
+        pageTextCoverage.push(Math.min(1, coveredArea / pageArea));
       } catch (error) {
         return savedUnparsed(
           'PDF_PAGE_ERROR',
@@ -158,34 +184,56 @@ async function extractPdf(input) {
       }
     }
 
-    if (!sawText) {
-      return savedUnparsed(
-        'PDF_NEEDS_OCR',
-        'PDF was saved but contains no extractable text; OCR is required',
-        { pageCount, textItems },
-        'NEEDS_OCR'
-      );
-    }
-    let content;
+    let canonicalPages;
     try {
-      content = canonicalizeExtractedText(pages.join('\n\n'));
+      canonicalPages = pages.map((page) => canonicalizeExtractedText(page));
     } catch (error) {
       return savedUnparsed(error.code || 'UNSAFE_EXTRACTED_TEXT', error.message, {
         pageCount, textItems,
       });
     }
-    if (!content) {
-      return savedUnparsed(
-        'PDF_NEEDS_OCR',
-        'PDF was saved but contains no extractable text; OCR is required',
-        { pageCount, textItems },
-        'NEEDS_OCR'
-      );
+    const pageTextChars = pageNonWhitespaceChars;
+    const ocrPageNumbers = pageTextChars
+      .map((count, index) => (pdfPageNeedsOcr({
+        textChars: count,
+        textItemCount: pageTextItemCounts[index],
+        meaningfulChars: pageMeaningfulChars[index],
+        textCoverage: pageTextCoverage[index],
+      }, limits) ? index + 1 : null))
+      .filter((pageNumber) => pageNumber !== null);
+    if (ocrPageNumbers.length > 0) {
+      return {
+        ...savedUnparsed(
+          'PDF_NEEDS_OCR',
+          'PDF contains scanned or low-text-density pages; selected-page OCR is required',
+          {
+            adapter: `pdfjs-dist@${pdfjs.version}-child`,
+            pageCount,
+            textItems,
+            pageTextChars,
+            pageTextItemCounts,
+            pageMeaningfulChars,
+            pageTextCoverage,
+            ocrPageNumbers,
+            sourceTruncated,
+          },
+          'NEEDS_OCR',
+          true
+        ),
+        pageTexts: canonicalPages,
+        ocrPageNumbers,
+      };
     }
+    const content = canonicalPages.join('\n\n').trim();
     return frameEvidence(content, { ...input.metadata, kind: 'pdf' }, limits, {
       adapter: `pdfjs-dist@${pdfjs.version}-child`,
       pageCount,
       textItems,
+      pageTextChars,
+      pageTextItemCounts,
+      pageMeaningfulChars,
+      pageTextCoverage,
+      ocrPageNumbers: [],
       sourceTruncated,
     });
   } finally {

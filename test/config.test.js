@@ -37,6 +37,13 @@ test('loads valid PM defaults and normalizes JIDs', () => {
   assert.equal(config.retention.messageDays, 30);
   assert.equal(config.reports.timezone, 'Asia/Kuala_Lumpur');
   assert.equal(config.reports.recoveryWindowHours, 24);
+  assert.equal(config.media.ocrLanguages, 'eng+chi_sim');
+  assert.equal(config.media.maxOcrPdfPages, 10);
+  assert.equal(config.media.ocrDesiredWidth, 1800);
+  assert.equal(config.media.ocrRecognizeTimeoutMs, 60_000);
+  assert.equal(config.media.pdfOcrRenderTimeoutMs, 120_000);
+  assert.equal(config.media.ocrCachePath, path.resolve('data/ocr-cache'));
+  assert.equal(config.media.ocrLangPath, path.resolve('data/tessdata'));
   assert.equal(config.backup.retentionCount, 14);
   assert.equal(config.database.path, path.resolve('data/wsb.sqlite3'));
 });
@@ -85,6 +92,13 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
     PM_TIMEZONE: 'Malaysia/Invalid',
     PM_VISION_POLICY: 'always-trust-ai',
     PM_OCR_ENABLED: 'yes',
+    PM_OCR_LANGUAGES: 'eng+../../bad',
+    PM_OCR_MAX_PDF_PAGES: '0',
+    PM_OCR_DESIRED_WIDTH: '100',
+    PM_OCR_MAX_IMAGE_MB: 'huge',
+    PM_OCR_PDF_MIN_TEXT_CHARS: '0',
+    PM_OCR_RECOGNIZE_TIMEOUT_MS: '1',
+    PM_OCR_PDF_RENDER_TIMEOUT_MS: 'forever',
     SCHEDULE_HOUR: '8am',
   });
 
@@ -109,9 +123,24 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
       assert.match(error.message, /PM_TIMEZONE/);
       assert.match(error.message, /PM_VISION_POLICY/);
       assert.match(error.message, /PM_OCR_ENABLED/);
+      assert.match(error.message, /PM_OCR_LANGUAGES/);
+      assert.match(error.message, /PM_OCR_MAX_PDF_PAGES/);
+      assert.match(error.message, /PM_OCR_DESIRED_WIDTH/);
+      assert.match(error.message, /PM_OCR_MAX_IMAGE_MB/);
+      assert.match(error.message, /PM_OCR_PDF_MIN_TEXT_CHARS/);
+      assert.match(error.message, /PM_OCR_RECOGNIZE_TIMEOUT_MS/);
+      assert.match(error.message, /PM_OCR_PDF_RENDER_TIMEOUT_MS/);
       assert.match(error.message, /SCHEDULE_HOUR/);
       return true;
     }
+  );
+});
+
+test('rejects configured image pixel ceilings above the 100m hard cap', () => {
+  assert.throws(
+    () => validateConfig(loadConfig({ ...VALID_ENV, PM_MAX_IMAGE_PIXELS: '100000001' })),
+    (error) => error instanceof ConfigValidationError
+      && /PM_MAX_IMAGE_PIXELS must be an integer from 1 to 100000000/u.test(error.message)
   );
 });
 
