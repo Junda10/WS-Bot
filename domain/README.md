@@ -10,7 +10,7 @@ The only normal forward path is:
 
 The first ERIC-confirmed reply performs the first transition. Further confirmed replies remain append-only on `REPLIED`. A member may resolve only a `REPLIED` issue, and an administrator may archive only a `RESOLVED` issue.
 
-Moving a reply is an administrator-only correction. It is limited to active `REPLIED` sources and `WAITING_TEVAU`/`REPLIED` targets. The affected statuses and first-response timestamps are recomputed from the remaining confirmed replies, and both issue timelines receive append-only movement events.
+Moving a reply is an administrator-only correction. It may correct historical associations from `REPLIED`, `RESOLVED`, or `ARCHIVED` sources into any visible target lifecycle state. First-response timestamps are recomputed from current confirmed replies; only active `REPLIED`/`WAITING_TEVAU` states may change, while resolved/archive states and timestamps are preserved. Both issue timelines receive append-only movement events whose before/after values identify the old and new association.
 
 ## Restore rules
 

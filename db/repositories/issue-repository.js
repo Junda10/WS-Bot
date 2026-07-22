@@ -218,7 +218,7 @@ class IssueRepository {
       SELECT * FROM issues
       WHERE chat_id = ? AND deleted_at IS NULL
         AND status IN ('WAITING_TEVAU', 'REPLIED')
-      ORDER BY created_at ASC, id ASC
+      ORDER BY id
     `).all(requireInteger(chatId, 'chatId', { min: 1 }));
   }
 
@@ -307,21 +307,27 @@ class IssueRepository {
       const updatedTarget = this.byId.get(targetIssueId);
       const movementBefore = {
         replyId,
-        fromIssueId: oldIssueId,
-        toIssueId: targetIssueId,
+        issueId: oldIssueId,
         sourceStatus: source.status,
         sourceFirstRepliedAt: source.first_replied_at,
+        sourceResolvedAt: source.resolved_at,
+        sourceArchivedAt: source.archived_at,
         targetStatus: target.status,
         targetFirstRepliedAt: target.first_replied_at,
+        targetResolvedAt: target.resolved_at,
+        targetArchivedAt: target.archived_at,
       };
       const movementAfter = {
         replyId,
-        fromIssueId: oldIssueId,
-        toIssueId: targetIssueId,
+        issueId: targetIssueId,
         sourceStatus: updatedSource.status,
         sourceFirstRepliedAt: updatedSource.first_replied_at,
+        sourceResolvedAt: updatedSource.resolved_at,
+        sourceArchivedAt: updatedSource.archived_at,
         targetStatus: updatedTarget.status,
         targetFirstRepliedAt: updatedTarget.first_replied_at,
+        targetResolvedAt: updatedTarget.resolved_at,
+        targetArchivedAt: updatedTarget.archived_at,
       };
       const sourceEvent = this.insertEvent({
         eventUid: sourceEventUid,

@@ -270,6 +270,25 @@ test('member create/update/resolve, ERIC replies, and admin archive follow the o
   }
 });
 
+test('expired confirmation failure durably marks the session EXPIRED', (t) => {
+  const { issues, repositories, setTime } = fixture(t);
+  setTime(1000);
+  const issue = issues.create(issueInput(MEMBER_JID, 'expired-confirm')).record;
+  createSession(repositories, issue, 'EXPIRED', 1010, { expiresAt: 1050 });
+
+  setTime(1051);
+  assert.throws(() => issues.confirmReply({
+    chatJid: CHAT_JID, actorJid: ERIC_JID, token: 'TOKEN-EXPIRED',
+    publicId: issue.public_id, eventUid: 'expired-confirm-event', replyUid: 'expired-reply',
+  }), errorCode('REPLY_CONFIRMATION_REJECTED'));
+
+  const session = repositories.replyMatches.findByToken('TOKEN-EXPIRED');
+  assert.equal(session.status, 'EXPIRED');
+  assert.equal(session.updated_at, 1051);
+  assert.equal(repositories.issues.findByPublicId(issue.public_id).status, ISSUE_STATUS.WAITING_TEVAU);
+  assert.equal(repositories.issues.listReplies(issue.id).length, 0);
+});
+
 test('soft delete and the two explicit archived restore rules preserve history', (t) => {
   const { issues, repositories, setTime } = fixture(t);
   assert.match(RESTORE_RULES.DELETED_ARCHIVED, /First restore visibility/);
@@ -320,6 +339,30 @@ test('soft delete and the two explicit archived restore rules preserve history',
   assert.throws(() => issues.restore({
     chatJid: CHAT_JID, actorJid: ADMIN_JID, publicId: issue.public_id,
   }), errorCode('NOT_RESTORABLE'));
+});
+
+test('show requires ADMIN before includeDeleted can reveal a soft-deleted issue', (t) => {
+  const { issues, setTime } = fixture(t);
+  setTime(1000);
+  const issue = issues.create(issueInput(MEMBER_JID, 'deleted-visibility')).record;
+  setTime(1010);
+  issues.delete({
+    chatJid: CHAT_JID, actorJid: ADMIN_JID, publicId: issue.public_id,
+    eventUid: 'deleted-visibility-delete', reason: 'Visibility authorization regression',
+  });
+
+  assert.throws(() => issues.show({
+    chatJid: CHAT_JID, actorJid: MEMBER_JID, publicId: issue.public_id,
+  }), errorCode('ISSUE_NOT_FOUND'));
+  assert.throws(() => issues.show({
+    chatJid: CHAT_JID, actorJid: MEMBER_JID, publicId: issue.public_id, includeDeleted: true,
+  }), errorCode('ROLE_REQUIRED'));
+
+  const shown = issues.show({
+    chatJid: CHAT_JID, actorJid: ADMIN_JID, publicId: issue.public_id, includeDeleted: true,
+  });
+  assert.equal(shown.issue.public_id, issue.public_id);
+  assert.equal(shown.issue.deleted_at, 1010);
 });
 
 test('cross-chat issues and reply sessions cannot be read or mutated through the authorized chat', (t) => {
@@ -477,12 +520,110 @@ test('admin move-reply is atomic, audited on both timelines, and recomputes resp
   assert.equal(moved.targetIssue.first_replied_at, 1030);
   assert.equal(repositories.issues.listReplies(source.id).length, 0);
   assert.equal(repositories.issues.listReplies(target.id).length, 1);
-  assert.equal(repositories.issues.listEvents(source.id).at(-1).event_uid, 'move-away');
-  assert.equal(repositories.issues.listEvents(target.id).at(-1).event_uid, 'move-into');
-  assert.equal(repositories.issues.listEvents(source.id).at(-1).reason, 'AI selected the wrong ticket');
+  const sourceEvent = repositories.issues.listEvents(source.id).at(-1);
+  const targetEvent = repositories.issues.listEvents(target.id).at(-1);
+  assert.equal(sourceEvent.event_uid, 'move-away');
+  assert.equal(targetEvent.event_uid, 'move-into');
+  assert.equal(sourceEvent.reason, 'AI selected the wrong ticket');
+  for (const event of [sourceEvent, targetEvent]) {
+    const before = JSON.parse(event.before_json);
+    const after = JSON.parse(event.after_json);
+    assert.equal(before.issueId, source.id, 'before audit identifies the old association');
+    assert.equal(after.issueId, target.id, 'after audit identifies the new association');
+    assert.equal(before.sourceStatus, ISSUE_STATUS.REPLIED);
+    assert.equal(after.sourceStatus, ISSUE_STATUS.WAITING_TEVAU);
+    assert.equal(before.targetStatus, ISSUE_STATUS.WAITING_TEVAU);
+    assert.equal(after.targetStatus, ISSUE_STATUS.REPLIED);
+  }
 });
 
-test('six open issues have injected-clock durations and stable oldest-first ordering', (t) => {
+test('admin can correct replies from resolved/archived issues into a resolved target without reopening lifecycle', (t) => {
+  const { issues, repositories, setTime } = fixture(t);
+  setTime(1000);
+  const resolvedSource = issues.create(issueInput(MEMBER_JID, 'resolved-source')).record;
+  const archivedSource = issues.create(issueInput(MEMBER_JID, 'archived-source')).record;
+  const resolvedTarget = issues.create(issueInput(MEMBER_JID, 'resolved-target')).record;
+
+  createSession(repositories, resolvedSource, 'HISTORY-RESOLVED', 1010);
+  setTime(1100);
+  const resolvedReply = issues.confirmReply({
+    chatJid: CHAT_JID, actorJid: ERIC_JID, token: 'TOKEN-HISTORY-RESOLVED',
+    publicId: resolvedSource.public_id, eventUid: 'history-resolved-confirm',
+    replyUid: 'history-resolved-reply',
+  }).reply;
+
+  createSession(repositories, archivedSource, 'HISTORY-ARCHIVED', 1110);
+  setTime(1200);
+  const archivedReply = issues.confirmReply({
+    chatJid: CHAT_JID, actorJid: ERIC_JID, token: 'TOKEN-HISTORY-ARCHIVED',
+    publicId: archivedSource.public_id, eventUid: 'history-archived-confirm',
+    replyUid: 'history-archived-reply',
+  }).reply;
+
+  createSession(repositories, resolvedTarget, 'HISTORY-TARGET', 1210);
+  setTime(1300);
+  const targetReply = issues.confirmReply({
+    chatJid: CHAT_JID, actorJid: ERIC_JID, token: 'TOKEN-HISTORY-TARGET',
+    publicId: resolvedTarget.public_id, eventUid: 'history-target-confirm',
+    replyUid: 'history-target-reply',
+  }).reply;
+
+  setTime(1400);
+  const sourceResolvedAt = issues.resolve({
+    chatJid: CHAT_JID, actorJid: MEMBER_JID, publicId: resolvedSource.public_id,
+    eventUid: 'history-resolved-resolve',
+  }).issue.resolved_at;
+  setTime(1410);
+  const archivedResolvedAt = issues.resolve({
+    chatJid: CHAT_JID, actorJid: MEMBER_JID, publicId: archivedSource.public_id,
+    eventUid: 'history-archived-resolve',
+  }).issue.resolved_at;
+  setTime(1420);
+  const archivedAt = issues.archive({
+    chatJid: CHAT_JID, actorJid: ADMIN_JID, publicId: archivedSource.public_id,
+    eventUid: 'history-source-archive',
+  }).issue.archived_at;
+  setTime(1430);
+  const targetResolvedAt = issues.resolve({
+    chatJid: CHAT_JID, actorJid: MEMBER_JID, publicId: resolvedTarget.public_id,
+    eventUid: 'history-target-resolve',
+  }).issue.resolved_at;
+
+  setTime(1500);
+  const fromResolved = issues.moveReply({
+    chatJid: CHAT_JID, actorJid: ADMIN_JID, replyId: resolvedReply.id,
+    toPublicId: resolvedTarget.public_id, sourceEventUid: 'move-resolved-away',
+    eventUid: 'move-resolved-into', reason: 'Historical resolved-ticket correction',
+  });
+  assert.equal(fromResolved.sourceIssue.status, ISSUE_STATUS.RESOLVED);
+  assert.equal(fromResolved.sourceIssue.first_replied_at, null);
+  assert.equal(fromResolved.sourceIssue.resolved_at, sourceResolvedAt);
+  assert.equal(fromResolved.targetIssue.status, ISSUE_STATUS.RESOLVED);
+  assert.equal(fromResolved.targetIssue.resolved_at, targetResolvedAt);
+  assert.equal(fromResolved.targetIssue.first_replied_at, 1100);
+
+  setTime(1510);
+  const fromArchived = issues.moveReply({
+    chatJid: CHAT_JID, actorJid: ADMIN_JID, replyId: archivedReply.id,
+    toPublicId: resolvedTarget.public_id, sourceEventUid: 'move-archived-away',
+    eventUid: 'move-archived-into', reason: 'Historical archived-ticket correction',
+  });
+  assert.equal(fromArchived.sourceIssue.status, ISSUE_STATUS.ARCHIVED);
+  assert.equal(fromArchived.sourceIssue.first_replied_at, null);
+  assert.equal(fromArchived.sourceIssue.resolved_at, archivedResolvedAt);
+  assert.equal(fromArchived.sourceIssue.archived_at, archivedAt);
+  assert.equal(fromArchived.targetIssue.status, ISSUE_STATUS.RESOLVED);
+  assert.equal(fromArchived.targetIssue.resolved_at, targetResolvedAt);
+  assert.equal(fromArchived.targetIssue.first_replied_at, 1100);
+  assert.deepEqual(repositories.issues.listReplies(resolvedTarget.id).map((reply) => reply.id), [
+    resolvedReply.id, archivedReply.id, targetReply.id,
+  ]);
+  assert.deepEqual(repositories.issues.listEvents(archivedSource.id).slice(-1).map((event) => event.event_type), [
+    'REPLY_MOVED',
+  ]);
+});
+
+test('six open issues sort by frozen/current waiting duration descending with stable ties', (t) => {
   const { issues, repositories, setTime } = fixture(t);
   const created = [];
   for (let index = 0; index < 6; index += 1) {
@@ -501,10 +642,15 @@ test('six open issues have injected-clock durations and stable oldest-first orde
   setTime(2000);
   const open = issues.listOpen({ chatJid: CHAT_JID, actorJid: MEMBER_ALIAS });
   assert.equal(open.length, 6);
-  assert.deepEqual(open.map((issue) => issue.public_id), ['TV1', 'TV2', 'TV3', 'TV4', 'TV5', 'TV6']);
-  assert.deepEqual(open.map((issue) => issue.waitingDurationMs), [1000, 1000, 300, 900, 800, 800]);
-  assert.equal(open[2].firstResponseDurationMs, 300);
+  assert.deepEqual(open.map((issue) => issue.public_id), ['TV1', 'TV2', 'TV4', 'TV5', 'TV6', 'TV3']);
+  assert.deepEqual(open.map((issue) => issue.waitingDurationMs), [1000, 1000, 900, 800, 800, 300]);
+  assert.equal(open.at(-1).firstResponseDurationMs, 300);
   assert.equal(open[0].firstResponseDurationMs, null);
+
+  setTime(5000);
+  const later = issues.listOpen({ chatJid: CHAT_JID, actorJid: MEMBER_JID });
+  assert.equal(later.find((issue) => issue.public_id === 'TV3').waitingDurationMs, 300,
+    'waiting duration freezes at the first confirmed response');
 });
 
 test('invalid clocks are rejected before domain mutation', (t) => {

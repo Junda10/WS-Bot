@@ -4,6 +4,7 @@ const config = require('../config');
 
 const ACTIONS = Object.freeze({
   VIEW: 'VIEW',
+  VIEW_DELETED: 'VIEW_DELETED',
   DOWNLOAD: 'DOWNLOAD',
   AI: 'AI',
   CREATE_ISSUE: 'CREATE_ISSUE',
@@ -18,6 +19,7 @@ const ACTIONS = Object.freeze({
 
 const REQUIRED_ROLE = Object.freeze({
   [ACTIONS.VIEW]: 'MEMBER',
+  [ACTIONS.VIEW_DELETED]: 'ADMIN',
   [ACTIONS.DOWNLOAD]: 'MEMBER',
   [ACTIONS.AI]: 'MEMBER',
   [ACTIONS.CREATE_ISSUE]: 'MEMBER',
@@ -110,7 +112,7 @@ class PermissionService {
   }
 
   beforeMutation(action, context, mutate) {
-    if ([ACTIONS.VIEW, ACTIONS.DOWNLOAD, ACTIONS.AI].includes(action)) {
+    if ([ACTIONS.VIEW, ACTIONS.VIEW_DELETED, ACTIONS.DOWNLOAD, ACTIONS.AI].includes(action)) {
       throw new TypeError('beforeMutation requires a mutation action');
     }
     return this.runAuthorized(action, context, mutate);

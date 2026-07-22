@@ -283,41 +283,54 @@ class IssueService {
     const principal = this.principal(ACTIONS.CONFIRM_REPLY, input);
     const now = this.now();
     const reason = this.reason(input.reason, 'Tevau reply confirmed by ERIC');
-    return this.repositories.transaction((tx) => {
-      const session = tx.replyMatches.findByToken(input.token);
-      if (!session || session.chat_id !== principal.chat.id) {
-        throw new IssueDomainError('REPLY_SESSION_NOT_FOUND', 'Reply session not found in this chat');
-      }
-      const issue = tx.issues.findByPublicId(input.publicId, { includeDeleted: true });
-      if (!issue || issue.chat_id !== principal.chat.id || issue.deleted_at !== null) {
-        throw new IssueDomainError('ISSUE_NOT_FOUND', 'Issue not found in the authorized chat');
-      }
-      if (![ISSUE_STATUS.WAITING_TEVAU, ISSUE_STATUS.REPLIED].includes(issue.status)) {
-        throw new IssueDomainError(
-          'ILLEGAL_TRANSITION',
-          `Replies cannot be confirmed for an issue in ${issue.status}`
-        );
-      }
-      const result = tx.replyMatches.confirm({
-        token: input.token,
-        ericJid: principal.actorJid,
-        issueId: issue.id,
-        eventUid: input.eventUid,
-        replyUid: input.replyUid,
-        reason,
-        now,
-      });
-      if (!result) {
-        throw new IssueDomainError(
-          'REPLY_CONFIRMATION_REJECTED',
-          'Reply token is expired, consumed, assigned to another ERIC, or does not include this issue'
-        );
-      }
-      return {
-        ...result,
-        firstResponseDurationMs: result.issue.first_replied_at - result.issue.created_at,
-      };
+    const session = this.repositories.replyMatches.findByToken(input.token);
+    if (!session || session.chat_id !== principal.chat.id) {
+      throw new IssueDomainError('REPLY_SESSION_NOT_FOUND', 'Reply session not found in this chat');
+    }
+
+    // Expiry is a durable outcome, not part of the failed confirmation unit of
+    // work. Persist it before throwing so a service-level failure cannot roll it
+    // back with the reply/issue transaction.
+    if (session.status === 'PENDING' && session.expires_at < now) {
+      this.repositories.replyMatches.expirePending({ token: input.token, now });
+      throw new IssueDomainError(
+        'REPLY_CONFIRMATION_REJECTED',
+        'Reply token is expired, consumed, assigned to another ERIC, or does not include this issue'
+      );
+    }
+
+    const issue = this.repositories.issues.findByPublicId(input.publicId, { includeDeleted: true });
+    if (!issue || issue.chat_id !== principal.chat.id || issue.deleted_at !== null) {
+      throw new IssueDomainError('ISSUE_NOT_FOUND', 'Issue not found in the authorized chat');
+    }
+    if (![ISSUE_STATUS.WAITING_TEVAU, ISSUE_STATUS.REPLIED].includes(issue.status)) {
+      throw new IssueDomainError(
+        'ILLEGAL_TRANSITION',
+        `Replies cannot be confirmed for an issue in ${issue.status}`
+      );
+    }
+    // Repository confirmation remains one atomic unit (session consumption,
+    // reply insertion, issue update, and audit insertion). It is intentionally
+    // not enclosed by a service transaction that could undo durable expiry.
+    const result = this.repositories.replyMatches.confirm({
+      token: input.token,
+      ericJid: principal.actorJid,
+      issueId: issue.id,
+      eventUid: input.eventUid,
+      replyUid: input.replyUid,
+      reason,
+      now,
     });
+    if (!result) {
+      throw new IssueDomainError(
+        'REPLY_CONFIRMATION_REJECTED',
+        'Reply token is expired, consumed, assigned to another ERIC, or does not include this issue'
+      );
+    }
+    return {
+      ...result,
+      firstResponseDurationMs: result.issue.first_replied_at - result.issue.created_at,
+    };
   }
 
   moveReply(input) {
@@ -331,17 +344,15 @@ class IssueService {
       }
       const source = tx.issues.findById(reply.current_issue_id, { includeDeleted: true });
       const target = this.findIssue(tx.issues, input.toPublicId, principal.chat.id);
-      if (!source || source.deleted_at !== null || source.status !== ISSUE_STATUS.REPLIED) {
+      if (!source || source.deleted_at !== null
+          || ![ISSUE_STATUS.REPLIED, ISSUE_STATUS.RESOLVED, ISSUE_STATUS.ARCHIVED].includes(source.status)) {
         throw new IssueDomainError(
           'ILLEGAL_MOVE',
-          'Replies can only be moved from an active REPLIED issue'
+          'Reply source must be a visible issue with a confirmed-reply lifecycle state'
         );
       }
-      if (![ISSUE_STATUS.WAITING_TEVAU, ISSUE_STATUS.REPLIED].includes(target.status)) {
-        throw new IssueDomainError(
-          'ILLEGAL_MOVE',
-          'Reply target must be WAITING_TEVAU or REPLIED'
-        );
+      if (!Object.values(ISSUE_STATUS).includes(target.status)) {
+        throw new IssueDomainError('ILLEGAL_MOVE', 'Reply target has an unsupported lifecycle state');
       }
       if (reply.confirmed_at < target.created_at) {
         throw new IssueDomainError('ILLEGAL_MOVE', 'Reply predates the target issue');
@@ -361,14 +372,24 @@ class IssueService {
   listOpen(input) {
     const principal = this.principal(ACTIONS.VIEW, input);
     const now = this.now();
-    return this.repositories.issues.listOpen(principal.chat.id).map((issue) => withDurations(issue, now));
+    return this.repositories.issues.listOpen(principal.chat.id)
+      .map((issue) => withDurations(issue, now))
+      .sort((left, right) => (
+        right.waitingDurationMs - left.waitingDurationMs
+        || left.created_at - right.created_at
+        || left.id - right.id
+      ));
   }
 
   show(input) {
-    const principal = this.principal(ACTIONS.VIEW, input);
+    const includeDeleted = input.includeDeleted === true;
+    const principal = this.principal(
+      includeDeleted ? ACTIONS.VIEW_DELETED : ACTIONS.VIEW,
+      input
+    );
     const now = this.now();
     const issue = this.findIssue(this.repositories.issues, input.publicId, principal.chat.id, {
-      includeDeleted: input.includeDeleted === true,
+      includeDeleted,
     });
     return {
       issue: withDurations(issue, now),

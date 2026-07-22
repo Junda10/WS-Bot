@@ -139,6 +139,18 @@ class ReplyMatchRepository {
     ) || null;
   }
 
+  expirePending(input) {
+    const now = requireTimestamp(input.now, 'now');
+    return this.db.prepare(`
+      UPDATE reply_match_sessions SET status = 'EXPIRED', updated_at = @now
+      WHERE token = @token AND status = 'PENDING' AND expires_at < @now
+      RETURNING *
+    `).get({
+      token: requireString(input.token, 'token', { min: 4, max: 128 }),
+      now,
+    }) || null;
+  }
+
   confirm(input) {
     const token = requireString(input.token, 'token', { min: 4, max: 128 });
     const ericJid = requireString(input.ericJid, 'ericJid', { max: 200 });
