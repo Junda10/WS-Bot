@@ -7,7 +7,7 @@ A WhatsApp bot that auto-replies "ok" to messages and shares Chinese news about:
 
 ## Prerequisites
 
-- **Node.js 18+** installed
+- **Node.js 22+** installed (required by the SQLite and media-processing dependencies)
 - **Google Chrome** or **Chromium** installed (for WhatsApp Web automation)
 - A **WhatsApp account** on your phone
 
@@ -28,7 +28,8 @@ brew install --cask chromium
 git clone https://github.com/Junda10/WS-Bot.git
 cd WS-Bot
 
-# 2. Install dependencies
+# 2. Verify Node and install dependencies
+node --version  # must be v22 or newer
 npm install
 
 # 3. Configure environment
@@ -80,7 +81,28 @@ All configuration is driven by `.env` (see `.env.example`). `config.js` is just 
 | `GROUP_ID` | Target group for morning broadcast | (required) |
 | `WEBSITE_WHITELIST` | JIDs allowed to call `!website` | empty |
 | `SCHEDULE_HOUR` / `SCHEDULE_MINUTE` | Daily news time | 8:00 |
-| `AUTO_REPLY_ENABLED` / `AUTO_REPLY_MESSAGE` | Auto-reply settings | `true` / `ok` |
+| `AUTO_REPLY_ENABLED` / `AUTO_REPLY_MESSAGE` | Auto-reply settings | `false` / `ok` |
+
+### Tevau PM persistence and security
+
+PM features are restricted by WhatsApp JID, never display name. Set all three identity values before startup; an empty or malformed value causes a clear startup configuration error.
+
+| Env var | Purpose | Default |
+|---|---|---|
+| `PM_AUTHORIZED_GROUP_JID` | Only group allowed to use PM ingestion and summaries (`@g.us`) | required |
+| `PM_ERIC_JID` | User allowed to confirm Tevau replies (`@c.us`/`@lid`) | required |
+| `PM_ADMIN_JIDS` | Comma-separated administrator JIDs | required |
+| `DB_PATH` / `DB_BUSY_TIMEOUT_MS` | SQLite location and lock wait | `data/wsb.sqlite3` / `5000` |
+| `PM_ATTACHMENTS_DIR` / `PM_TEMP_DIR` | Archived and temporary media directories | under `data/` |
+| `PM_MAX_FILE_MB` | Maximum attachment size | `20` |
+| `PM_MESSAGE_RETENTION_DAYS` | Ordinary message retention | `30` |
+| `PM_TIMEZONE` / `PM_REPORT_RECOVERY_HOURS` | Report timezone and startup catch-up window | `Asia/Kuala_Lumpur` / `24` |
+| `PM_OCR_ENABLED` / `PM_OCR_LANGUAGES` | Local OCR switch and languages | `true` / `eng+chi_sim` |
+| `PM_VISION_POLICY` | `off`, `ocr-only`, `ocr-first`, or `vision-first` | `ocr-first` |
+| `PM_BACKUP_DIR` / `PM_BACKUP_RETENTION_COUNT` | Local snapshot directory and count | `data/backups` / `14` |
+| `PM_BACKUP_REMOTE_URL` | Optional off-host backup destination | unset |
+
+Runtime databases (including WAL/SHM files), attachments, temporary files, backups, and OCR data are ignored by Git. Never commit the real `.env`.
 
 ### Clarification (ask-user threshold) module
 

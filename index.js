@@ -4,6 +4,14 @@ const qrcode = require('qrcode-terminal');
 const cron = require('node-cron');
 const axios = require('axios');
 const config = require('./config');
+
+try {
+  config.assertValid();
+} catch (error) {
+  console.error(`❌ ${error.message}`);
+  process.exit(1);
+}
+
 const { fetchNews, formatNewsMessage, getAllNews } = require('./news-fetcher');
 const { summarizeNews, smartReply, extractPreference, answerWithSlots, chat } = require('./ai');
 const { addFact, trackTopic, getTopTopics, getFactsSummary, clearMemory } = require('./memory');

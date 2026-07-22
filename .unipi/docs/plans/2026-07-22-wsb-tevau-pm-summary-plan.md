@@ -26,7 +26,7 @@ specs:
 
 ## Tasks
 
-- unstarted: Task 1 — 固定运行时、依赖与安全配置基线
+- completed: Task 1 — 固定运行时、依赖与安全配置基线
   - Description: 明确 Node 22+ 基线，加入数据库、时区、附件解析和 OCR 依赖；扩展配置校验与运行目录忽略规则，为后续模块提供可注入配置。
   - Dependencies: None
   - Acceptance Criteria:

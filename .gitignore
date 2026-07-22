@@ -18,6 +18,23 @@ data/
 user-memory.json
 reply-cache.json
 
+# PM persistence (also cover custom paths placed inside the repository)
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-wal
+*.db-shm
+attachments/
+tmp/
+temp/
+backups/
+ocr-data/
+tessdata/
+
 # Generated user websites
 sites/
 
