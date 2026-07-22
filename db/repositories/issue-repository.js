@@ -339,6 +339,116 @@ class IssueRepository {
     `).all(requireInteger(chatId, 'chatId', { min: 1 }));
   }
 
+  listReportEvents(chatId, start, end) {
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    const windowStart = requireTimestamp(start, 'start');
+    const windowEnd = requireTimestamp(end, 'end');
+    if (windowEnd <= windowStart) throw new RangeError('end must be greater than start');
+    // Mutable issue rows are intentionally absent. Labels and lifecycle state
+    // come from the latest audit snapshot at or before each event, so a later
+    // update/delete cannot rewrite an earlier report.
+    return this.db.prepare(`
+      SELECT e.*,
+        (SELECT json_extract(h.after_json, '$.publicId')
+         FROM issue_events h
+         WHERE h.issue_id = e.issue_id
+           AND (h.occurred_at < e.occurred_at
+             OR (h.occurred_at = e.occurred_at AND h.id <= e.id))
+           AND json_type(h.after_json, '$.publicId') IS NOT NULL
+         ORDER BY h.occurred_at DESC, h.id DESC LIMIT 1) AS historical_public_id,
+        (SELECT json_extract(h.after_json, '$.title')
+         FROM issue_events h
+         WHERE h.issue_id = e.issue_id
+           AND (h.occurred_at < e.occurred_at
+             OR (h.occurred_at = e.occurred_at AND h.id <= e.id))
+           AND json_type(h.after_json, '$.title') IS NOT NULL
+         ORDER BY h.occurred_at DESC, h.id DESC LIMIT 1) AS historical_title,
+        (SELECT json_extract(h.after_json, '$.status')
+         FROM issue_events h
+         WHERE h.issue_id = e.issue_id
+           AND (h.occurred_at < e.occurred_at
+             OR (h.occurred_at = e.occurred_at AND h.id <= e.id))
+           AND json_type(h.after_json, '$.status') IS NOT NULL
+         ORDER BY h.occurred_at DESC, h.id DESC LIMIT 1) AS historical_status
+      FROM issue_events e
+      WHERE e.chat_id = @chatId AND e.occurred_at >= @windowStart
+        AND e.occurred_at < @windowEnd
+        AND e.event_type IN (
+          'CREATED', 'REPLY_CONFIRMED', 'RESOLVED', 'ARCHIVED',
+          'DELETED', 'RESTORED', 'UPDATED'
+        )
+      ORDER BY e.occurred_at, e.id
+    `).all({ chatId: id, windowStart, windowEnd });
+  }
+
+  historicalReportStats(chatId, start, end) {
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    const windowStart = requireTimestamp(start, 'start');
+    const windowEnd = requireTimestamp(end, 'end');
+    if (windowEnd <= windowStart) throw new RangeError('end must be greater than start');
+    const counts = this.db.prepare(`
+      SELECT
+        count(DISTINCT CASE WHEN event_type = 'CREATED' THEN issue_id END) AS created_issue_count,
+        count(DISTINCT CASE WHEN event_type = 'REPLY_CONFIRMED' THEN issue_id END) AS replied_issue_count,
+        count(CASE WHEN event_type = 'REPLY_CONFIRMED' THEN 1 END) AS reply_event_count,
+        count(DISTINCT CASE WHEN event_type = 'RESOLVED' THEN issue_id END) AS resolved_issue_count
+      FROM issue_events
+      WHERE chat_id = @chatId AND occurred_at >= @windowStart AND occurred_at < @windowEnd
+    `).get({ chatId: id, windowStart, windowEnd });
+    const unresolvedAtEnd = this.db.prepare(`
+      WITH historical_issues AS (
+        SELECT DISTINCT issue_id
+        FROM issue_events
+        WHERE chat_id = @chatId AND occurred_at < @windowEnd
+      ), states AS (
+        SELECT issue_id,
+          (SELECT json_extract(e.after_json, '$.status')
+           FROM issue_events e
+           WHERE e.issue_id = historical_issues.issue_id AND e.chat_id = @chatId
+             AND e.occurred_at < @windowEnd
+             AND json_type(e.after_json, '$.status') IS NOT NULL
+           ORDER BY e.occurred_at DESC, e.id DESC LIMIT 1) AS status,
+          (SELECT json_extract(e.after_json, '$.deletedAt')
+           FROM issue_events e
+           WHERE e.issue_id = historical_issues.issue_id AND e.chat_id = @chatId
+             AND e.occurred_at < @windowEnd
+             AND json_type(e.after_json, '$.deletedAt') IS NOT NULL
+           ORDER BY e.occurred_at DESC, e.id DESC LIMIT 1) AS deleted_at
+        FROM historical_issues
+      )
+      SELECT count(*) AS count FROM states
+      WHERE status IN ('WAITING_TEVAU', 'REPLIED') AND deleted_at IS NULL
+    `).get({ chatId: id, windowEnd }).count;
+    return { ...counts, unresolved_at_end_issue_count: unresolvedAtEnd };
+  }
+
+  listCurrentReportIssues(chatId) {
+    return this.db.prepare(`
+      SELECT i.*,
+        count(a.id) AS attachment_count,
+        COALESCE(sum(CASE WHEN a.id IS NOT NULL AND (
+          a.processing_status IN ('PENDING', 'PROCESSING')
+          OR a.parse_status IN ('PENDING', 'PARSING', 'NEEDS_OCR')
+        ) THEN 1 ELSE 0 END), 0) AS attachment_parse_pending_count,
+        COALESCE(sum(CASE WHEN a.id IS NOT NULL AND (
+          a.processing_status = 'FAILED' OR a.parse_status = 'FAILED'
+        ) THEN 1 ELSE 0 END), 0) AS attachment_parse_failed_count,
+        COALESCE(sum(CASE WHEN a.parse_status = 'SAVED_UNPARSED'
+          THEN 1 ELSE 0 END), 0) AS attachment_saved_unparsed_count,
+        s.extraction_status AS source_extraction_status,
+        s.ai_error_code AS source_ai_error_code,
+        s.ai_error_message AS source_ai_error_message,
+        s.uncertainties_json AS source_uncertainties_json
+      FROM issues i
+      LEFT JOIN attachments a ON a.issue_id = i.id AND a.deleted_at IS NULL
+      LEFT JOIN issue_source_snapshots s ON s.issue_id = i.id
+      WHERE i.chat_id = ? AND i.deleted_at IS NULL
+        AND i.status IN ('WAITING_TEVAU', 'REPLIED')
+      GROUP BY i.id
+      ORDER BY i.id
+    `).all(requireInteger(chatId, 'chatId', { min: 1 }));
+  }
+
   // Bounded read models for deterministic AI shortlisting. These deliberately
   // avoid listOpen(), which may grow without bound, and never return records to
   // the model directly; CandidateShortlistService compacts the selected rows.

@@ -260,6 +260,19 @@ class MessageRepository {
     `).all(id, windowStart, windowEnd);
   }
 
+  countWindow(chatId, start, end, { includeCommands = true, includeTombstones = false } = {}) {
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    const windowStart = requireTimestamp(start, 'start');
+    const windowEnd = requireTimestamp(end, 'end');
+    if (windowEnd <= windowStart) throw new RangeError('end must be greater than start');
+    return this.db.prepare(`
+      SELECT count(*) AS count FROM messages
+      WHERE chat_id = ? AND sent_at >= ? AND sent_at < ?
+        ${includeCommands ? '' : 'AND is_command = 0'}
+        ${includeTombstones ? '' : 'AND is_tombstone = 0'}
+    `).get(id, windowStart, windowEnd).count;
+  }
+
   listSummarySourcesWindow(chatId, start, end, options = {}) {
     const id = requireInteger(chatId, 'chatId', { min: 1 });
     const windowStart = requireTimestamp(start, 'start');

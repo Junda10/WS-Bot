@@ -212,7 +212,7 @@ specs:
     3. 实现 confirm/cancel/expiry 及主动工单更新消息。
     4. 测试并行 session、错误候选、非 Eric、重启、重复确认和回复移动。
 
-- unstarted: Task 14 — 实现报告时间窗与确定性 PM 报告数据
+- completed: Task 14 — 实现报告时间窗与确定性 PM 报告数据
   - Description: 使用 Luxon 计算 Kuala Lumpur 固定窗口，并从数据库生成不依赖 AI 的工单变化、昨日统计和完整未闭环队列。
   - Dependencies: Tasks 3, 4
   - Acceptance Criteria:
