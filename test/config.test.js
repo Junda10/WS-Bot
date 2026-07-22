@@ -26,6 +26,11 @@ test('loads valid PM defaults and normalizes JIDs', () => {
   assert.equal(config.pm.ericJid, '60111111111@c.us');
   assert.deepEqual(config.pm.adminJids, ['60222222222@c.us', '60333333333@lid']);
   assert.equal(config.storage.maxFileBytes, 20 * 1024 * 1024);
+  assert.equal(config.storage.maxPdfPages, 100);
+  assert.equal(config.storage.maxImagePixels, 40_000_000);
+  assert.equal(config.storage.maxDocxUncompressedBytes, 100 * 1024 * 1024);
+  assert.equal(config.storage.maxExtractedChars, 1_000_000);
+  assert.equal(config.storage.processingTimeoutMs, 120_000);
   assert.equal(config.retention.messageDays, 30);
   assert.equal(config.reports.timezone, 'Asia/Kuala_Lumpur');
   assert.equal(config.reports.recoveryWindowHours, 24);
@@ -64,6 +69,11 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
     PM_ERIC_JID: '120300000000000000@g.us',
     PM_ADMIN_JIDS: 'not a jid',
     PM_MAX_FILE_MB: '20MB',
+    PM_MAX_PDF_PAGES: '0',
+    PM_MAX_IMAGE_PIXELS: 'many',
+    PM_MAX_DOCX_UNCOMPRESSED_MB: '0',
+    PM_MAX_EXTRACTED_CHARS: '-1',
+    PM_FILE_PROCESSING_TIMEOUT_MS: '999999999',
     PM_MESSAGE_RETENTION_DAYS: '0',
     PM_REPORT_RECOVERY_HOURS: 'forever',
     PM_TIMEZONE: 'Malaysia/Invalid',
@@ -80,6 +90,11 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
       assert.match(error.message, /PM_ERIC_JID/);
       assert.match(error.message, /PM_ADMIN_JIDS/);
       assert.match(error.message, /PM_MAX_FILE_MB/);
+      assert.match(error.message, /PM_MAX_PDF_PAGES/);
+      assert.match(error.message, /PM_MAX_IMAGE_PIXELS/);
+      assert.match(error.message, /PM_MAX_DOCX_UNCOMPRESSED_MB/);
+      assert.match(error.message, /PM_MAX_EXTRACTED_CHARS/);
+      assert.match(error.message, /PM_FILE_PROCESSING_TIMEOUT_MS/);
       assert.match(error.message, /PM_MESSAGE_RETENTION_DAYS/);
       assert.match(error.message, /PM_REPORT_RECOVERY_HOURS/);
       assert.match(error.message, /PM_TIMEZONE/);

@@ -10,6 +10,9 @@ const { createRepositories } = require('./db/repositories');
 const { IssueService } = require('./services/issue-service');
 const { PermissionService } = require('./services/permission-service');
 const { createDebouncedSmartReplyScheduler } = require('./services/debounced-smart-reply');
+const { AttachmentStorage } = require('./services/attachment-storage');
+const { AttachmentProcessingQueue } = require('./services/attachment-processing-queue');
+const { AttachmentService } = require('./services/attachment-service');
 const { WhatsAppAdapter } = require('./whatsapp/adapter');
 const { AuthorizedGroupIngress, createMessageEventHandler } = require('./whatsapp/ingress');
 const { createPmCommandHandlers } = require('./commands/pm-handler');
@@ -120,9 +123,28 @@ const client = new Client({
   },
 });
 const whatsappAdapter = new WhatsAppAdapter({ client });
+const attachmentStorage = new AttachmentStorage({
+  rootDir: config.storage.attachmentsDir,
+  tempDir: config.storage.tempDir,
+});
+const attachmentQueue = new AttachmentProcessingQueue({
+  concurrency: 1,
+  maxPending: config.storage.maxQueuePending,
+});
+const attachmentService = new AttachmentService({
+  repositories,
+  permissionService,
+  issueService,
+  storage: attachmentStorage,
+  queue: attachmentQueue,
+  adapter: whatsappAdapter,
+  limits: config.storage,
+  clock: appClock,
+});
 const pmHandlers = createPmCommandHandlers({
   issueService,
   permissionService,
+  attachmentService,
   adapter: whatsappAdapter,
   attachmentsDir: config.storage.attachmentsDir,
   clock: appClock,
@@ -155,8 +177,52 @@ client.on('qr', (qr) => {
 });
 
 let schedulesRegistered = false;
-client.on('ready', () => {
+let attachmentRecoveryComplete = false;
+let attachmentRecoveryPromise = null;
+let attachmentRecoveryRetryTimer = null;
+async function onWhatsAppReady() {
   console.log('✅ 机器人已连接!');
+
+  // Authorized ingress starts closed. This makes it safe to reclaim every
+  // prior-process claim immediately, even when its old lease has not expired.
+  // Concurrent/repeated ready events share one recovery attempt; only a
+  // successful attempt opens ingress and permits schedule registration.
+  if (!attachmentRecoveryComplete) {
+    if (!attachmentRecoveryPromise) {
+      attachmentRecoveryPromise = Promise.resolve().then(() => {
+        const reclaimedMessages = repositories.messages.recoverProcessingForStartup(
+          authorizedChat.id,
+          appClock()
+        );
+        if (reclaimedMessages.length > 0) {
+          console.log(`💬 消息恢复：回收 ${reclaimedMessages.length} 个旧进程处理声明`);
+        }
+        return attachmentService.recoverPending();
+      }).then((recovery) => {
+        attachmentRecoveryComplete = true;
+        handleIncomingMessage.startAuthorizedIngress();
+        console.log(`📎 附件恢复：排队 ${recovery.queued.length}，入队失败 ${recovery.failedAdmissions.length}，孤儿清理 ${recovery.removedOrphans.length}`);
+        return recovery;
+      }).finally(() => {
+        attachmentRecoveryPromise = null;
+      });
+    }
+    try {
+      await attachmentRecoveryPromise;
+    } catch (error) {
+      console.error(`❌ 附件启动恢复失败: ${error.message}`);
+      if (!attachmentRecoveryRetryTimer) {
+        attachmentRecoveryRetryTimer = setTimeout(() => {
+          attachmentRecoveryRetryTimer = null;
+          onWhatsAppReady().catch((retryError) => {
+            console.error(`❌ 附件启动恢复重试失败: ${retryError.message}`);
+          });
+        }, 5000);
+        attachmentRecoveryRetryTimer.unref?.();
+      }
+      return;
+    }
+  }
 
   if (schedulesRegistered) {
     console.log('ℹ️ 定时任务已注册，跳过重复 ready 初始化');
@@ -190,7 +256,8 @@ client.on('ready', () => {
   //   console.log('📰 首次启动，发送测试新闻...');
   //   sendMorningNews();
   // }, 10000);
-});
+}
+client.on('ready', onWhatsAppReady);
 
 client.on('authenticated', () => console.log('🔐 认证成功'));
 client.on('auth_failure', (msg) => console.error('❌ 认证失败:', msg));
@@ -574,6 +641,7 @@ const authorizedGroupIngress = new AuthorizedGroupIngress({
   permissionService,
   route: routeAuthorizedMessage,
   isDuplicate: isDuplicateMessage,
+  attachmentService,
   clock: appClock,
 });
 const handleIncomingMessage = createMessageEventHandler({
@@ -582,6 +650,7 @@ const handleIncomingMessage = createMessageEventHandler({
   routeLegacy: routeExistingMessage,
   isDuplicate: isDuplicateMessage,
   clock: appClock,
+  authorizedInitiallyAccepting: false,
 });
 function onClientMessage(message) {
   handleIncomingMessage(message).catch((error) => {
@@ -897,10 +966,16 @@ async function shutdown(signal) {
     clearTimeout(reinitTimer);
     reinitTimer = null;
   }
+  if (attachmentRecoveryRetryTimer) {
+    clearTimeout(attachmentRecoveryRetryTimer);
+    attachmentRecoveryRetryTimer = null;
+  }
+  attachmentService.stopRecovery();
 
   // Stop admission first, then let accepted handlers finish their durable
   // PROCESSED/FAILED transition before either transport or database disappears.
   handleIncomingMessage.stopAccepting();
+  attachmentQueue.stopAccepting();
   smartReplyScheduler.stopAccepting();
   const cancelled = smartReplyScheduler.cancelPending();
   if (cancelled > 0) {
@@ -919,6 +994,12 @@ async function shutdown(signal) {
     });
     if (smartReplyDrain.timedOut) {
       console.warn(`Smart-reply drain timed out with ${smartReplyDrain.remaining} operation(s) still active`);
+    }
+    const attachmentDrain = await attachmentQueue.drain({
+      timeoutMs: drain.timedOut ? 0 : 10_000,
+    });
+    if (attachmentDrain.timedOut) {
+      console.warn(`Attachment queue drain timed out with ${attachmentDrain.active} active and ${attachmentDrain.pending} pending`);
     }
   } catch (error) {
     console.warn(`WhatsApp ingress drain failed: ${error.message}`);

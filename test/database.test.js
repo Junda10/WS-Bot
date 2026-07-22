@@ -154,6 +154,59 @@ test('project migration 004 preserves existing messages and adds bounded display
   assert.deepEqual(db.pragma('foreign_key_check'), []);
 });
 
+test('project migration 005 preserves transport MIME only as declared provenance', (t) => {
+  const fixture = makeFixture(t);
+  const projectMigrations = path.join(__dirname, '..', 'db', 'migrations');
+  for (const name of [
+    '001_database_baseline.sql',
+    '002_pm_domain_schema.sql',
+    '003_durable_message_ingress.sql',
+    '004_message_sender_display_name.sql',
+  ]) {
+    fs.copyFileSync(path.join(projectMigrations, name), path.join(fixture.migrationsDir, name));
+  }
+  const db = openFixture(t, fixture);
+  migrateDatabase(db, { migrationsDir: fixture.migrationsDir, now: () => 1 });
+  db.exec(`
+    INSERT INTO chats (chat_uid, jid, timezone, created_at, updated_at)
+    VALUES ('mime-upgrade-chat', '120300000000000000@g.us', 'UTC', 10, 10);
+    INSERT INTO messages (
+      message_uid, whatsapp_message_id, chat_id, sender_jid, body,
+      sent_at, received_at, created_at
+    ) VALUES ('mime-message', 'mime-message', 1, '601@c.us', 'legacy media', 20, 20, 20);
+    INSERT INTO attachments (
+      attachment_uid, idempotency_key, chat_id, message_id, message_chat_id,
+      source_whatsapp_message_id, display_name, detected_mime, size_bytes,
+      retention_class, processing_status, created_at, updated_at
+    ) VALUES (
+      'mime-attachment', 'mime-attachment', 1, 1, 1,
+      'mime-message', 'legacy.md', 'text/markdown', 42,
+      'TEMPORARY', 'PENDING', 20, 20
+    );
+  `);
+  fs.copyFileSync(
+    path.join(projectMigrations, '005_secure_attachment_pipeline.sql'),
+    path.join(fixture.migrationsDir, '005_secure_attachment_pipeline.sql')
+  );
+  assert.deepEqual(migrateDatabase(db, {
+    migrationsDir: fixture.migrationsDir, now: () => 2,
+  }), { applied: [5], currentVersion: 5 });
+  const attachment = db.prepare(`
+    SELECT declared_mime, detected_mime, media_whatsapp_message_id
+    FROM attachments WHERE attachment_uid = 'mime-attachment'
+  `).get();
+  assert.deepEqual(attachment, {
+    declared_mime: 'text/markdown',
+    detected_mime: null,
+    media_whatsapp_message_id: 'mime-message',
+  });
+  const blobColumns = db.prepare('PRAGMA table_info(attachment_blobs)').all()
+    .map((column) => column.name);
+  assert.equal(blobColumns.includes('detected_mime'), false);
+  assert.equal(blobColumns.includes('detected_extension'), false);
+  assert.deepEqual(db.pragma('foreign_key_check'), []);
+});
+
 test('production PRAGMAs and private POSIX permissions are effective on disk', (t) => {
   const fixture = makeFixture(t);
   const db = openFixture(t, fixture);

@@ -181,6 +181,18 @@ class MessageRepository {
     return transaction();
   }
 
+  recoverProcessingForStartup(chatId, now) {
+    requireTimestamp(now, 'now');
+    return this.db.prepare(`
+      UPDATE messages
+      SET processing_status = 'FAILED', processing_claim_id = NULL,
+          processing_lease_expires_at = NULL, processing_completed_at = NULL,
+          processing_last_error = 'Prior-process message route was reclaimed during startup recovery'
+      WHERE chat_id = @chatId AND processing_status = 'PROCESSING'
+      RETURNING *
+    `).all({ chatId: requireInteger(chatId, 'chatId', { min: 1 }) });
+  }
+
   claimProcessing(id, options = {}) {
     const messageId = requireInteger(id, 'id', { min: 1 });
     const now = requireTimestamp(options.now, 'now');

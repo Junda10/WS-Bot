@@ -11,6 +11,7 @@ const { migrateDatabase } = require('../db/migrate');
 const { createRepositories } = require('../db/repositories');
 const { createMessageDeduper } = require('../message-deduper');
 const { createDebouncedSmartReplyScheduler } = require('../services/debounced-smart-reply');
+const { QueueFullError } = require('../services/attachment-processing-queue');
 const { PermissionService } = require('../services/permission-service');
 const { WhatsAppAdapter } = require('../whatsapp/adapter');
 const { AuthorizedGroupIngress, createMessageEventHandler } = require('../whatsapp/ingress');
@@ -313,7 +314,9 @@ test('authorized ingress persists before routing and stores quote/media metadata
     'SELECT * FROM attachments WHERE message_id = ?'
   ).get(persisted.id);
   assert.equal(attachment.display_name, 'notes.md');
-  assert.equal(attachment.detected_mime, 'text/markdown');
+  assert.equal(attachment.declared_mime, 'text/markdown');
+  assert.equal(attachment.detected_mime, null);
+  assert.equal(attachment.media_whatsapp_message_id, 'authorized-media-id');
   assert.equal(attachment.size_bytes, 42);
   assert.equal(attachment.processing_status, 'PENDING');
   assert.equal(downloads, 0);
@@ -711,6 +714,113 @@ test('legacy route failure is not retained by the memory deduper', async (t) => 
   await assert.rejects(handler(direct), /legacy temporary failure/);
   assert.equal((await handler(direct)).duplicate, false);
   assert.equal(attempts, 2);
+});
+
+test('fetched outgoing group media uses id.remote as authoritative chat, never from', async () => {
+  const payload = Buffer.from('outgoing group evidence');
+  const adapter = new WhatsAppAdapter({ client: new FakeClient() });
+  const outgoing = {
+    id: { _serialized: 'outgoing-media', remote: GROUP_JID },
+    from: BOT_JID,
+    _data: {},
+    async downloadMedia() {
+      return { data: payload.toString('base64'), mimetype: 'text/plain', filename: 'proof.txt' };
+    },
+  };
+  const downloaded = await adapter.downloadAttachment(outgoing, {
+    expectedMessageId: 'outgoing-media', expectedChatJid: GROUP_JID, maxBytes: 100,
+  });
+  assert.deepEqual(downloaded.buffer, payload);
+  await assert.rejects(adapter.downloadAttachment({
+    ...outgoing,
+    id: { _serialized: 'wrong-chat-media', remote: OTHER_GROUP_JID },
+    from: GROUP_JID,
+  }, {
+    expectedMessageId: 'wrong-chat-media', expectedChatJid: GROUP_JID, maxBytes: 100,
+  }), (error) => error.code === 'MEDIA_SOURCE_MISMATCH');
+});
+
+test('authorized ingress stays paused through startup recovery and opens idempotently afterward', async (t) => {
+  const { repositories, permissionService, chat } = fixture(t);
+  const prior = repositories.messages.create({
+    whatsappMessageId: 'prior-process-message', chatId: chat.id,
+    senderJid: USER_JID, body: '!news', sentAt: 1_720_000_480_000,
+    receivedAt: 1_720_000_480_001,
+  }).record;
+  repositories.messages.claimProcessing(prior.id, {
+    claimId: 'dead-prior-message', now: 1_720_000_480_001, leaseMs: 999_999,
+  });
+  const reclaimed = repositories.messages.recoverProcessingForStartup(
+    chat.id, 1_720_000_500_000
+  );
+  assert.deepEqual(reclaimed.map((row) => row.id), [prior.id]);
+  assert.equal(repositories.messages.findById(prior.id).processing_status, 'FAILED');
+  let routes = 0;
+  const handler = createMessageEventHandler({
+    ingress: new AuthorizedGroupIngress({
+      repositories, permissionService, route: async () => { routes += 1; },
+    }),
+    adapter: new WhatsAppAdapter({ client: new FakeClient() }),
+    routeLegacy: async () => { routes += 1; },
+    clock: () => 1_720_000_500_000,
+    authorizedInitiallyAccepting: false,
+  });
+  const authorized = rawMessage({
+    id: 'paused-authorized', from: GROUP_JID, author: USER_JID, timestamp: 1_720_000_490,
+  });
+  assert.deepEqual(await handler(authorized), {
+    accepted: false, duplicate: false, source: 'startup-recovery',
+  });
+  assert.equal(repositories.messages.findByWhatsappId('paused-authorized'), null);
+  assert.equal(routes, 0);
+  assert.equal(handler.startAuthorizedIngress(), true);
+  assert.equal(handler.startAuthorizedIngress(), true, 'repeated ready/open is safe');
+  assert.equal((await handler(authorized)).duplicate, false);
+  assert.equal(routes, 1);
+});
+
+test('attachment queue saturation is contained inside ingress and message routing still completes', async (t) => {
+  const { repositories, permissionService } = fixture(t);
+  let routed = 0;
+  const attachmentService = {
+    captureIncoming() { throw new QueueFullError(1); },
+    recordCaptureFailure(attachmentId, error) {
+      return repositories.attachments.markCaptureFailed({
+        attachmentId,
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+        now: 1_720_000_600_001,
+      });
+    },
+  };
+  const ingress = new AuthorizedGroupIngress({
+    repositories,
+    permissionService,
+    attachmentService,
+    logger: { warn() {}, error() {} },
+    route: async () => { routed += 1; },
+    clock: () => 1_720_000_600_000,
+  });
+  const handler = createMessageEventHandler({
+    ingress,
+    adapter: new WhatsAppAdapter({ client: new FakeClient() }),
+    routeLegacy: async () => {},
+    clock: () => 1_720_000_600_000,
+  });
+  const result = await handler(rawMessage({
+    id: 'saturated-media', from: GROUP_JID, author: USER_JID,
+    hasMedia: true, type: 'document', timestamp: 1_720_000_590,
+    _data: { mimetype: 'text/plain', filename: 'busy.txt', size: 10 },
+  }));
+  assert.equal(result.record.processing_status, 'PROCESSED');
+  assert.equal(routed, 1);
+  const attachment = repositories.attachments.db.prepare(
+    'SELECT * FROM attachments WHERE message_id = ?'
+  ).get(result.record.id);
+  assert.equal(attachment.processing_status, 'FAILED');
+  assert.equal(attachment.last_error_code, 'QUEUE_FULL');
+  assert.equal(attachment.retryable, 1);
 });
 
 test('disabled authorized chat rejects before persistence and route side effects', async (t) => {

@@ -70,6 +70,7 @@ function formatPmHelp(topic = '') {
 !pm resolve TV1 note="验证说明"
 !pm resend-file TV1 <附件编号> — 在本群重发已归档附件
 !pm attachment TV1 <附件编号> — resend-file 的同义别名
+!pm retry-file TV1 — 重试该工单所有可重试的失败附件
 
 参数含空格时使用单引号或双引号；key=value 每个键只能出现一次。`;
   const eric = `🧭 *PM 命令帮助｜Eric*
@@ -170,7 +171,10 @@ function formatAttachment(attachment, publicId) {
   const availability = attachment.storage_key ? '可重发' : '尚无归档文件';
   const displayName = safeDisplayLine(attachment.display_name, { fallback: '未命名附件' });
   const processingStatus = safeDisplayLine(attachment.processing_status, { fallback: '状态未知' });
-  return `#${attachment.id} ${displayName}\n  ${mime}｜${size}｜${processingStatus}｜${availability}\n  重发：!pm resend-file ${safeDisplayLine(publicId)} ${attachment.id}`;
+  const failure = attachment.processing_status === 'FAILED'
+    ? `\n  失败：${safeDisplayLine(attachment.last_error_code, { fallback: 'PROCESSING_FAILED' })}｜${attachment.retryable ? '可重试' : '不可重试'}`
+    : '';
+  return `#${attachment.id} ${displayName}\n  ${mime}｜${size}｜${processingStatus}｜${availability}${failure}\n  重发：!pm resend-file ${safeDisplayLine(publicId)} ${attachment.id}`;
 }
 
 function formatIssueDetail(detail) {

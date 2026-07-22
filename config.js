@@ -129,6 +129,20 @@ function loadConfig(env = process.env) {
       tempDir: path.resolve(root, env.PM_TEMP_DIR || 'data/tmp'),
       maxFileMb,
       maxFileBytes: Number.isFinite(maxFileMb) ? maxFileMb * 1024 * 1024 : Number.NaN,
+      // Parsing/OCR tasks consume these centralized resource ceilings. Task 8
+      // already enforces byte, image-header, DOCX ZIP and wall-clock limits.
+      maxPdfPages: readInteger(env, 'PM_MAX_PDF_PAGES', 100),
+      maxImagePixels: readInteger(env, 'PM_MAX_IMAGE_PIXELS', 40_000_000),
+      maxDocxUncompressedBytes: readInteger(
+        env,
+        'PM_MAX_DOCX_UNCOMPRESSED_MB',
+        100
+      ) * 1024 * 1024,
+      maxExtractedChars: readInteger(env, 'PM_MAX_EXTRACTED_CHARS', 1_000_000),
+      processingTimeoutMs: readInteger(env, 'PM_FILE_PROCESSING_TIMEOUT_MS', 120_000),
+      maxZipEntries: readInteger(env, 'PM_MAX_DOCX_ZIP_ENTRIES', 10_000),
+      maxDocxCompressionRatio: readInteger(env, 'PM_MAX_DOCX_COMPRESSION_RATIO', 100),
+      maxQueuePending: readInteger(env, 'PM_ATTACHMENT_QUEUE_MAX_PENDING', 100),
     },
 
     retention: {
@@ -219,6 +233,28 @@ function validateConfig(config, { requirePm = true } = {}) {
   if (!config.database.path) errors.push('DB_PATH must not be empty');
   integerInRange(config.database.busyTimeoutMs, 0, 120000, 'DB_BUSY_TIMEOUT_MS');
   integerInRange(config.storage.maxFileMb, 1, 100, 'PM_MAX_FILE_MB');
+  integerInRange(config.storage.maxPdfPages, 1, 10000, 'PM_MAX_PDF_PAGES');
+  integerInRange(config.storage.maxImagePixels, 1, 1_000_000_000, 'PM_MAX_IMAGE_PIXELS');
+  if (!Number.isSafeInteger(config.storage.maxDocxUncompressedBytes)
+      || config.storage.maxDocxUncompressedBytes < 1024 * 1024
+      || config.storage.maxDocxUncompressedBytes > 10 * 1024 * 1024 * 1024) {
+    errors.push('PM_MAX_DOCX_UNCOMPRESSED_MB must be an integer from 1 to 10240');
+  }
+  integerInRange(config.storage.maxExtractedChars, 1, 100_000_000, 'PM_MAX_EXTRACTED_CHARS');
+  integerInRange(
+    config.storage.processingTimeoutMs,
+    1000,
+    60 * 60 * 1000,
+    'PM_FILE_PROCESSING_TIMEOUT_MS'
+  );
+  integerInRange(config.storage.maxZipEntries, 10, 100_000, 'PM_MAX_DOCX_ZIP_ENTRIES');
+  integerInRange(
+    config.storage.maxDocxCompressionRatio,
+    2,
+    10_000,
+    'PM_MAX_DOCX_COMPRESSION_RATIO'
+  );
+  integerInRange(config.storage.maxQueuePending, 1, 100_000, 'PM_ATTACHMENT_QUEUE_MAX_PENDING');
   integerInRange(config.retention.messageDays, 1, 3650, 'PM_MESSAGE_RETENTION_DAYS');
   validTimezone(config.reports.timezone, 'PM_TIMEZONE');
   integerInRange(config.reports.recoveryWindowHours, 1, 168, 'PM_REPORT_RECOVERY_HOURS');

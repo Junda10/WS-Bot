@@ -515,6 +515,23 @@ class IssueService {
     };
   }
 
+  attachmentsForRetry(input) {
+    const principal = this.principal(ACTIONS.DOWNLOAD, input);
+    const issue = this.findIssue(
+      this.repositories.issues,
+      input.publicId,
+      principal.chat.id
+    );
+    return {
+      issue,
+      attachments: this.repositories.attachments.listRetryableForIssue(
+        issue.id,
+        input.now ?? this.now()
+      ),
+      chatJid: principal.chat.jid,
+    };
+  }
+
   attachmentForResend(input) {
     const principal = this.principal(ACTIONS.DOWNLOAD, input);
     const issue = this.findIssue(

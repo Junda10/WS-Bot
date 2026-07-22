@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { sanitizeDisplayName } = require('../services/attachment-type');
 const { normalizeMessage } = require('./normalize-message');
 
 const DEFAULT_PROCESSING_LEASE_MS = 10 * 60 * 1000;
@@ -23,6 +24,10 @@ class AuthorizedGroupIngress {
     this.isDuplicate = options.isDuplicate || (() => false);
     this.logger = options.logger || console;
     this.clock = options.clock || Date.now;
+    this.attachmentService = options.attachmentService || null;
+    if (this.attachmentService && typeof this.attachmentService.captureIncoming !== 'function') {
+      throw new TypeError('attachmentService must provide captureIncoming()');
+    }
     this.processingLeaseMs = options.processingLeaseMs ?? DEFAULT_PROCESSING_LEASE_MS;
     if (!Number.isSafeInteger(this.processingLeaseMs) || this.processingLeaseMs < 1) {
       throw new TypeError('processingLeaseMs must be a positive safe integer');
@@ -66,10 +71,13 @@ class AuthorizedGroupIngress {
         attachment = this.repositories.attachments.create({
           idempotencyKey: `${normalized.id}:media:0`,
           messageId: messageResult.record.id,
-          displayName: metadata.fileName || `whatsapp-${metadata.type || 'media'}-${normalized.id}`,
-          // This is transport-declared MIME metadata. Task 8 will replace/verify it
-          // using magic bytes before parsing or archiving the payload.
-          detectedMime: metadata.mimeType,
+          displayName: sanitizeDisplayName(
+            metadata.fileName || `whatsapp-${metadata.type || 'media'}-${normalized.id}`
+          ),
+          // Transport MIME/name are provenance only. Byte detection owns the
+          // detected fields before any payload is archived or parsed.
+          declaredMime: metadata.mimeType,
+          mediaWhatsappMessageId: normalized.id,
           sizeBytes: metadata.sizeBytes ?? 0,
           processingStatus: 'PENDING',
           now: normalized.receivedAt,
@@ -147,6 +155,33 @@ class AuthorizedGroupIngress {
 
     this.activeMessageIds.add(normalized.id);
     try {
+      if (persisted.attachment && this.attachmentService) {
+        try {
+          const processing = this.attachmentService.captureIncoming({
+            attachment: persisted.attachment,
+            message,
+            normalized,
+            persisted: claimed,
+          });
+          processing?.catch((error) => {
+            this.logger.warn?.(`Attachment processing failed (${error.code || 'UNKNOWN'}): ${normalized.id}`);
+          });
+        } catch (captureError) {
+          // Attachment admission is deliberately non-fatal to message routing.
+          // Queue saturation, stopped queues, and capture validation failures
+          // must not strand the durable message claim in PROCESSING.
+          try {
+            this.attachmentService.recordCaptureFailure?.(persisted.attachment.id, captureError);
+          } catch (persistError) {
+            this.logger.error?.(
+              `Could not persist attachment capture failure ${persisted.attachment.id}: ${persistError.message}`
+            );
+          }
+          this.logger.warn?.(
+            `Attachment capture was not admitted (${captureError.code || 'UNKNOWN'}): ${normalized.id}`
+          );
+        }
+      }
       try {
         await this.route(message, normalized, claimed);
       } catch (routeError) {
@@ -203,6 +238,7 @@ function createMessageEventHandler(options = {}) {
   const isDuplicate = options.isDuplicate || (() => false);
   const clock = options.clock || Date.now;
   let accepting = true;
+  let authorizedAccepting = options.authorizedInitiallyAccepting !== false;
   const inFlight = new Set();
 
   async function dispatch(rawMessage) {
@@ -213,7 +249,12 @@ function createMessageEventHandler(options = {}) {
       && (typeof options.ingress.accepts === 'function'
         ? options.ingress.accepts(normalized.chatJid)
         : true);
-    if (isAuthorizedGroup) return options.ingress.handle(normalized, message);
+    if (isAuthorizedGroup) {
+      if (!authorizedAccepting) {
+        return { accepted: false, duplicate: false, source: 'startup-recovery' };
+      }
+      return options.ingress.handle(normalized, message);
+    }
 
     // PM persistence/authorization is scoped only to the configured group.
     // Direct chats and every other group retain the pre-Task-5 legacy route.
@@ -246,8 +287,19 @@ function createMessageEventHandler(options = {}) {
     return operation;
   }
 
+  onMessage.startAuthorizedIngress = () => {
+    if (!accepting) return false;
+    authorizedAccepting = true;
+    return true;
+  };
+  onMessage.pauseAuthorizedIngress = () => {
+    authorizedAccepting = false;
+    return inFlight.size;
+  };
+  onMessage.isAuthorizedIngressAccepting = () => accepting && authorizedAccepting;
   onMessage.stopAccepting = () => {
     accepting = false;
+    authorizedAccepting = false;
     return inFlight.size;
   };
   onMessage.isAccepting = () => accepting;

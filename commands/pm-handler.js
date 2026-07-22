@@ -193,6 +193,7 @@ function createPmCommandHandlers(options = {}) {
   const split = options.split || splitWhatsAppText;
   const maxOutputLength = options.maxOutputLength;
   const attachmentsDir = options.attachmentsDir;
+  const attachmentService = options.attachmentService || null;
 
   if (!issueService || typeof issueService.show !== 'function') {
     throw new TypeError('PM handlers require IssueService');
@@ -386,6 +387,31 @@ function createPmCommandHandlers(options = {}) {
       }
       const result = issueService.moveReply(input);
       return { text: formatMutationSuccess('move-reply', result), value: result };
+    }),
+
+    'retry-file': wrap(async (context) => {
+      if (!attachmentService || typeof attachmentService.retryIssue !== 'function') {
+        throw new IssueDomainError('ATTACHMENT_UNAVAILABLE', 'Attachment retry service is unavailable');
+      }
+      const identity = base(context);
+      const [rawId, ...extra] = context.parsed.args;
+      if (extra.length > 0) throw new CommandInputError('TOO_MANY_ARGUMENTS', '附件重试不接受额外参数');
+      const result = attachmentService.retryIssue({
+        ...identity,
+        publicId: publicId(rawId),
+      });
+      const queuedText = result.attachmentIds.length > 0
+        ? `⏳ ${result.issue.public_id} 已排队重试 ${result.attachmentIds.length} 个附件：${result.attachmentIds.map((id) => `#${id}`).join('、')}`
+        : null;
+      const inFlightText = result.inFlightAttachmentIds?.length > 0
+        ? `ℹ️ ${result.inFlightAttachmentIds.length} 个附件已有处理中任务（未重复排队）：${result.inFlightAttachmentIds.map((id) => `#${id}`).join('、')}`
+        : null;
+      const failedText = result.failedAdmissions?.length > 0
+        ? `❌ ${result.failedAdmissions.length} 个附件未进入队列（保持可重试失败状态）：${result.failedAdmissions.map((failure) => `#${failure.attachmentId} ${failure.code}`).join('、')}`
+        : null;
+      const text = [queuedText, inFlightText, failedText].filter(Boolean).join('\n')
+        || `ℹ️ ${result.issue.public_id} 没有可重试或待恢复的附件。`;
+      return { text, value: result };
     }),
 
     'resend-file': wrap(async (context) => {

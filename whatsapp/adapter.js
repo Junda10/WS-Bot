@@ -9,6 +9,51 @@ function defaultMediaFactory(filePath) {
   return MessageMedia.fromFilePath(filePath);
 }
 
+class MediaDownloadError extends Error {
+  constructor(code, message, options = {}) {
+    super(message, options);
+    this.name = 'MediaDownloadError';
+    this.code = code;
+    this.retryable = options.retryable !== false;
+  }
+}
+
+function decodeMediaPayload(media, maxBytes) {
+  if (!media || typeof media.data !== 'string' || media.data.length === 0) {
+    throw new MediaDownloadError('MEDIA_EXPIRED', 'WhatsApp media is unavailable or expired');
+  }
+  if (Number.isSafeInteger(maxBytes)) {
+    const maxEncodedLength = Math.ceil(maxBytes / 3) * 4;
+    // Standard WhatsApp payloads contain no whitespace. Permit a small amount
+    // for compatibility, but reject before replace() can allocate a huge copy.
+    if (media.data.length > maxEncodedLength + 1024) {
+      throw new MediaDownloadError('FILE_TOO_LARGE', `Encoded media exceeds ${maxBytes} bytes`, {
+        retryable: false,
+      });
+    }
+  }
+  const compact = media.data.replace(/\s+/gu, '');
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(compact)) {
+    throw new MediaDownloadError('DOWNLOAD_INVALID_BASE64', 'WhatsApp returned invalid media data', {
+      retryable: false,
+    });
+  }
+  const estimatedBytes = Math.floor(compact.length * 3 / 4)
+    - (compact.endsWith('==') ? 2 : (compact.endsWith('=') ? 1 : 0));
+  if (Number.isSafeInteger(maxBytes) && estimatedBytes > maxBytes) {
+    throw new MediaDownloadError('FILE_TOO_LARGE', `Media exceeds ${maxBytes} bytes`, {
+      retryable: false,
+    });
+  }
+  const buffer = Buffer.from(compact, 'base64');
+  if (Number.isSafeInteger(maxBytes) && buffer.length > maxBytes) {
+    throw new MediaDownloadError('FILE_TOO_LARGE', `Media exceeds ${maxBytes} bytes`, {
+      retryable: false,
+    });
+  }
+  return buffer;
+}
+
 function sentReceipt(result) {
   if (!result) return { id: null, sentAt: null, raw: result };
   let sentAt = null;
@@ -60,6 +105,111 @@ class WhatsAppAdapter {
       }));
     }
     return receipts;
+  }
+
+  _assertDownloadedIdentity(message, options = {}) {
+    if (!options.expectedMessageId && !options.expectedChatJid) return;
+    const actualId = serializedId(message?.id || message?._data?.id);
+    // For fetched outgoing group messages, `from` is the sender account while
+    // the authoritative conversation is always the message key's id.remote.
+    const remote = message?.id?.remote || message?._data?.id?.remote || message?.from;
+    const actualChat = normalizeChatJid(remote);
+    if (options.expectedMessageId && actualId !== String(options.expectedMessageId)) {
+      throw new MediaDownloadError(
+        'MEDIA_SOURCE_MISMATCH',
+        'Fetched WhatsApp message ID does not match the authorized attachment source',
+        { retryable: false }
+      );
+    }
+    if (options.expectedChatJid && actualChat !== normalizeChatJid(options.expectedChatJid)) {
+      throw new MediaDownloadError(
+        'MEDIA_SOURCE_MISMATCH',
+        'Fetched WhatsApp message belongs to a different chat',
+        { retryable: false }
+      );
+    }
+  }
+
+  async downloadAttachment(message, options = {}) {
+    if (!message || typeof message.downloadMedia !== 'function') {
+      throw new MediaDownloadError('MEDIA_UNAVAILABLE', 'WhatsApp message cannot download media');
+    }
+    this._assertDownloadedIdentity(message, options);
+    if (options.signal?.aborted) {
+      throw new MediaDownloadError('DOWNLOAD_ABORTED', 'WhatsApp media download was aborted');
+    }
+    const declaredSize = Number(message._data?.size ?? message._data?.filesize
+      ?? message._data?.fileSize ?? options.sizeBytes);
+    if (Number.isSafeInteger(options.maxBytes) && Number.isFinite(declaredSize)
+        && declaredSize > options.maxBytes) {
+      throw new MediaDownloadError('FILE_TOO_LARGE', `Media exceeds ${options.maxBytes} bytes`, {
+        retryable: false,
+      });
+    }
+    let media;
+    try {
+      media = await message.downloadMedia();
+    } catch (error) {
+      const expired = /expired|not found|gone|unavailable|media.*missing/iu.test(String(error?.message || ''));
+      throw new MediaDownloadError(
+        expired ? 'MEDIA_EXPIRED' : 'DOWNLOAD_FAILED',
+        expired ? 'WhatsApp media is expired' : 'WhatsApp media download failed',
+        { cause: error }
+      );
+    }
+    if (options.signal?.aborted) {
+      throw new MediaDownloadError('DOWNLOAD_ABORTED', 'WhatsApp media download was aborted');
+    }
+    const buffer = decodeMediaPayload(media, options.maxBytes);
+    return Object.freeze({
+      buffer,
+      mimeType: String(media.mimetype || message._data?.mimetype || options.mimeType || '').trim() || null,
+      fileName: String(media.filename || message._data?.filename || options.fileName || '').trim() || null,
+      sizeBytes: buffer.length,
+    });
+  }
+
+  async downloadQuotedAttachment(message, options = {}) {
+    if (!message || typeof message.getQuotedMessage !== 'function') {
+      throw new MediaDownloadError('QUOTED_MEDIA_UNAVAILABLE', 'Quoted WhatsApp message is unavailable');
+    }
+    let quoted;
+    try {
+      quoted = await message.getQuotedMessage();
+    } catch (error) {
+      throw new MediaDownloadError('MEDIA_EXPIRED', 'Quoted WhatsApp media is expired or unavailable', {
+        cause: error,
+      });
+    }
+    if (!quoted || quoted.hasMedia !== true) {
+      throw new MediaDownloadError('QUOTED_MEDIA_UNAVAILABLE', 'Quoted message has no downloadable attachment', {
+        retryable: false,
+      });
+    }
+    this._assertDownloadedIdentity(quoted, options);
+    return this.downloadAttachment(quoted, options);
+  }
+
+  async downloadAttachmentByMessageId(whatsappMessageId, options = {}) {
+    if (typeof this.client.getMessageById !== 'function') {
+      throw new MediaDownloadError('MEDIA_LOOKUP_UNAVAILABLE', 'WhatsApp client cannot look up source media');
+    }
+    let message;
+    try {
+      message = await this.client.getMessageById(String(whatsappMessageId || ''));
+    } catch (error) {
+      throw new MediaDownloadError('DOWNLOAD_FAILED', 'WhatsApp source media lookup failed', {
+        cause: error,
+      });
+    }
+    if (!message) {
+      throw new MediaDownloadError('MEDIA_EXPIRED', 'WhatsApp source media is expired or unavailable');
+    }
+    this._assertDownloadedIdentity(message, {
+      ...options,
+      expectedMessageId: options.expectedMessageId || whatsappMessageId,
+    });
+    return this.downloadAttachment(message, options);
   }
 
   async sendArchivedAttachment(chatJid, attachment, options = {}) {
@@ -118,4 +268,9 @@ class WhatsAppAdapter {
   }
 }
 
-module.exports = { WhatsAppAdapter, sentReceipt };
+module.exports = {
+  MediaDownloadError,
+  WhatsAppAdapter,
+  decodeMediaPayload,
+  sentReceipt,
+};

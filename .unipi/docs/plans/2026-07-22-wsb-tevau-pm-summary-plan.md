@@ -126,7 +126,7 @@ specs:
     3. 接入附件重发授权检查，但暂不负责解析。
     4. 测试正常、无权限、已删除、不存在和超长输出场景。
 
-- unstarted: Task 8 — 建立附件存储、安全边界与处理队列
+- completed: Task 8 — 建立附件存储、安全边界与处理队列
   - Description: 安全下载引用附件，检测真实类型、限制资源、原子存储、哈希去重，并让 CPU 密集解析脱离 message handler 串行执行。
   - Dependencies: Tasks 1, 3, 5
   - Acceptance Criteria:
