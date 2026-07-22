@@ -141,7 +141,7 @@ specs:
     3. 记录 processing attempts、失败原因和可重试状态。
     4. 测试伪造 MIME、路径穿越、重复文件、ZIP bomb 限制和磁盘错误。
 
-- unstarted: Task 9 — 实现 Markdown、纯文字、PDF 与 DOCX 解析
+- completed: Task 9 — 实现 Markdown、纯文字、PDF 与 DOCX 解析
   - Description: 将 Markdown/UTF-8 文本、PDF 和 DOCX 转换为受限的可总结文本；普通群内 Markdown 自动进入摘要上下文。
   - Dependencies: Task 8
   - Acceptance Criteria:

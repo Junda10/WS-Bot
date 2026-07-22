@@ -101,6 +101,7 @@ function fixture(t, options = {}) {
   };
   const service = new AttachmentService({
     repositories, permissionService, issueService, storage, queue, adapter, processor,
+    extractor: options.extractor,
     limits: { ...LIMITS, ...(options.limits || {}) }, clock, logger: { warn() {}, error() {} },
   });
   let messageNumber = 0;
@@ -248,6 +249,77 @@ test('SHA-256 dedupe stores one blob while preserving two sanitized attachment r
   assert.equal(context.repositories.attachments.listAttempts(second.id)[0].status, 'SUCCEEDED');
 });
 
+test('duplicate archive candidate is removed even when its extraction fails', async (t) => {
+  let extractionCalls = 0;
+  const extractor = {
+    async process() {
+      extractionCalls += 1;
+      if (extractionCalls === 2) {
+        const error = new Error('second extraction failed');
+        error.code = 'PARSER_FAILED';
+        error.retryable = true;
+        throw error;
+      }
+      return {
+        status: 'PARSED', text: '[UNTRUSTED ATTACHMENT EVIDENCE]\ncanonical',
+        errorCode: null, errorMessage: null, retryable: false,
+        metadata: { adapter: 'dedupe-test', truncated: false },
+      };
+    },
+  };
+  const context = fixture(t, { extractor });
+  const first = context.attachment({ idempotencyKey: 'dedupe-parse-first' });
+  const second = context.attachment({ idempotencyKey: 'dedupe-parse-second' });
+  const payload = downloadable(Buffer.from('duplicate parse failure bytes'));
+  await context.service.enqueue(first.id, async () => payload);
+  await assert.rejects(context.service.enqueue(second.id, async () => payload), /second extraction failed/u);
+
+  const files = fs.readdirSync(context.archiveDir, { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile());
+  assert.equal(files.length, 1, 'only the canonical blob may remain on disk');
+  assert.equal(context.repositories.attachments.findById(second.id).processing_status, 'FAILED');
+  assert.equal(context.db.prepare('SELECT count(*) AS count FROM attachment_blobs').get().count, 1);
+});
+
+test('queue admission failure releases its claim and startup recovery can re-admit it', async (t) => {
+  const adapter = {
+    async downloadAttachment() { throw new Error('not used'); },
+    async downloadQuotedAttachment() { throw new Error('not used'); },
+    async downloadAttachmentByMessageId() {
+      return downloadable(Buffer.from('admission recovered bytes'));
+    },
+  };
+  const context = fixture(t, { adapter });
+  const record = context.attachment({ idempotencyKey: 'admission-recovery' });
+  const realQueue = context.service.queue;
+  context.service.queue = {
+    enqueue() {
+      const error = new Error('queue admission rejected');
+      error.code = 'QUEUE_FULL';
+      error.retryable = true;
+      throw error;
+    },
+  };
+  assert.throws(
+    () => context.service.enqueue(record.id, async () => downloadable(Buffer.from('unused'))),
+    /queue admission rejected/u
+  );
+  const failed = context.repositories.attachments.findById(record.id);
+  assert.equal(failed.processing_status, 'FAILED');
+  assert.equal(failed.processing_claim_id, null);
+  assert.equal(failed.retryable, 1);
+  assert.equal(failed.last_error_code, 'QUEUE_FULL');
+
+  context.service.queue = realQueue;
+  const recovered = await context.service.recoverPending();
+  assert.deepEqual(recovered.queued, [record.id]);
+  const drainResult = await realQueue.drain({ timeoutMs: 10_000 });
+  assert.equal(drainResult.drained, true, `recovery queue did not drain: ${JSON.stringify(drainResult)}`);
+  const ready = context.repositories.attachments.findById(record.id);
+  assert.equal(ready.processing_status, 'READY');
+  assert.equal(ready.parse_status, 'PARSED');
+});
+
 test('temporary content promotes atomically into an issue archive without changing its hash', async (t) => {
   const context = fixture(t);
   const record = context.attachment();
@@ -371,16 +443,18 @@ test('serialized queue concurrency is one and retry-file service path is authori
     chatJid: CHAT_JID, actorJid: MEMBER_JID, publicId: issue.public_id,
   });
   assert.deepEqual(retried.attachmentIds, [first.id, second.id]);
-  await context.queue.drain({ timeoutMs: 1000 });
+  const drainResult = await context.queue.drain({ timeoutMs: 10_000 });
+  assert.equal(drainResult.drained, true, `retry queue did not drain: ${JSON.stringify(drainResult)}`);
   assert.equal(maxActive, 1);
   assert.equal(adapter.lookups, 2);
   for (const attachmentId of retried.attachmentIds) {
     const row = context.repositories.attachments.findById(attachmentId);
-    assert.equal(row.processing_status, 'UNPARSED');
-    assert.equal(row.next_attempt_number, 3);
+    assert.equal(row.processing_status, 'READY');
+    assert.equal(row.parse_status, 'PARSED');
+    assert.equal(row.next_attempt_number, 4);
     assert.deepEqual(
       context.repositories.attachments.listAttempts(attachmentId).map((attempt) => attempt.status),
-      ['FAILED', 'SUCCEEDED']
+      ['FAILED', 'SUCCEEDED', 'SUCCEEDED']
     );
   }
 });
@@ -405,6 +479,7 @@ test('quoted attachment capture checks chat/member authorization before WhatsApp
       senderJid: MEMBER_JID,
       quoted: {
         id: 'quoted-media-id', chatJid: CHAT_JID,
+        senderJid: '60999999999@c.us', sentAt: 1_719_999_000_000,
         media: { fileName: '../../quoted.txt', mimeType: 'text/plain', sizeBytes: 11 },
       },
     },
@@ -424,8 +499,14 @@ test('quoted attachment capture checks chat/member authorization before WhatsApp
   assert.equal(adapter.quotedCalls, 1);
   const stored = context.repositories.attachments.findById(captured.attachment.id);
   assert.equal(stored.media_whatsapp_message_id, 'quoted-media-id');
+  assert.equal(stored.source_whatsapp_message_id, 'quoted-media-id');
+  assert.equal(stored.source_sender_jid, '60999999999@c.us');
+  assert.equal(stored.source_sent_at, 1_719_999_000_000);
+  assert.equal(stored.capture_message_id, command.id);
+  assert.equal(stored.capture_whatsapp_message_id, command.whatsapp_message_id);
   assert.equal(stored.display_name, 'quoted.txt');
-  assert.equal(stored.processing_status, 'UNPARSED');
+  assert.equal(stored.processing_status, 'READY');
+  assert.equal(stored.parse_status, 'PARSED');
 });
 
 test('WhatsApp media decoder enforces actual bytes and distinguishes expiry/download failures', async () => {
@@ -604,7 +685,7 @@ test('startup recovery reclaims future-leased prior claims but preserves live cu
   releaseCurrent();
   await currentOperation;
   await context.queue.drain({ timeoutMs: 1000 });
-  assert.equal(context.repositories.attachments.findById(prior.id).processing_status, 'UNPARSED');
+  assert.equal(context.repositories.attachments.findById(prior.id).processing_status, 'READY');
 });
 
 test('retry reports an expired but still-running non-abortable job as in-flight, never newly queued', async (t) => {
@@ -636,7 +717,7 @@ test('retry reports an expired but still-running non-abortable job as in-flight,
   assert.equal(adapter.lookups, 0);
   release();
   await operation;
-  assert.equal(context.repositories.attachments.listAttempts(record.id).length, 1);
+  assert.equal(context.repositories.attachments.listAttempts(record.id).length, 2);
 });
 
 test('orphan cleanup quarantines symlinks and continues after per-file removal errors', async (t) => {

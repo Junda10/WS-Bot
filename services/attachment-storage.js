@@ -302,6 +302,39 @@ class AttachmentStorage {
     }
   }
 
+  async read(storageKey, options = {}) {
+    const maxBytes = options.maxBytes ?? null;
+    if (maxBytes !== null && (!Number.isSafeInteger(maxBytes) || maxBytes < 1)) {
+      throw new TypeError('read maxBytes must be null or a positive safe integer');
+    }
+    const filePath = this._safeStoragePath(storageKey);
+    try {
+      const stats = await this.promises.stat(filePath);
+      if (!stats.isFile()) {
+        throw new AttachmentStorageError('UNSAFE_STORAGE_PATH', 'Archived attachment is not a regular file', {
+          retryable: false,
+        });
+      }
+      if (maxBytes !== null && stats.size > maxBytes) {
+        throw new AttachmentStorageError('FILE_TOO_LARGE', 'Archived attachment exceeds read limit', {
+          retryable: false,
+        });
+      }
+      const buffer = await this.promises.readFile(filePath);
+      if (maxBytes !== null && buffer.length > maxBytes) {
+        throw new AttachmentStorageError('FILE_TOO_LARGE', 'Archived attachment exceeds read limit', {
+          retryable: false,
+        });
+      }
+      return buffer;
+    } catch (error) {
+      if (error instanceof AttachmentStorageError) throw error;
+      throw new AttachmentStorageError('ARCHIVE_READ_FAILED', 'Could not read archived attachment', {
+        cause: error,
+      });
+    }
+  }
+
   async remove(storageKey) {
     const filePath = this._safeStoragePath(storageKey, { allowMissing: true });
     try {

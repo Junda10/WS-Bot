@@ -12,6 +12,10 @@ const {
 } = require('./shared');
 
 const PROCESSING_STATUSES = new Set(['PENDING', 'PROCESSING', 'READY', 'FAILED', 'UNPARSED']);
+const PARSE_STATUSES = new Set([
+  'NOT_APPLICABLE', 'PENDING', 'PARSING', 'PARSED',
+  'SAVED_UNPARSED', 'NEEDS_OCR', 'FAILED',
+]);
 const ATTEMPT_OPERATIONS = new Set(['DOWNLOAD', 'DETECT', 'EXTRACT', 'OCR', 'ARCHIVE']);
 
 function hydrateBlob(row) {
@@ -50,7 +54,7 @@ class AttachmentRepository {
     const messageId = input.messageId == null ? null : requireInteger(input.messageId, 'messageId', { min: 1 });
     if (messageId === null && issueId === null) throw new TypeError('messageId or issueId is required');
     const message = messageId === null ? null : this.db.prepare(
-      'SELECT id, chat_id, whatsapp_message_id FROM messages WHERE id = ?'
+      'SELECT id, chat_id, whatsapp_message_id, sender_jid, sent_at FROM messages WHERE id = ?'
     ).get(messageId);
     const issue = issueId === null ? null : this.db.prepare(
       'SELECT id, chat_id FROM issues WHERE id = ?'
@@ -72,7 +76,22 @@ class AttachmentRepository {
       chatId,
       messageId,
       messageChatId: message?.chat_id ?? null,
-      sourceWhatsappMessageId: message?.whatsapp_message_id ?? null,
+      sourceWhatsappMessageId: optionalString(
+        Object.hasOwn(input, 'sourceWhatsappMessageId')
+          ? input.sourceWhatsappMessageId : message?.whatsapp_message_id,
+        'sourceWhatsappMessageId',
+        { max: 500 }
+      ),
+      sourceSenderJid: optionalString(
+        Object.hasOwn(input, 'sourceSenderJid') ? input.sourceSenderJid : message?.sender_jid,
+        'sourceSenderJid',
+        { max: 200 }
+      ),
+      sourceSentAt: (Object.hasOwn(input, 'sourceSentAt') ? input.sourceSentAt : message?.sent_at) == null
+        ? null
+        : requireTimestamp(Object.hasOwn(input, 'sourceSentAt') ? input.sourceSentAt : message.sent_at, 'sourceSentAt'),
+      captureMessageId: message?.id ?? null,
+      captureWhatsappMessageId: message?.whatsapp_message_id ?? null,
       issueId,
       issueChatId: issue?.chat_id ?? null,
       displayName: requireString(input.displayName, 'displayName', { max: 1000 }),
@@ -95,13 +114,17 @@ class AttachmentRepository {
     const created = this.db.prepare(`
       INSERT INTO attachments (
         attachment_uid, idempotency_key, chat_id, message_id, message_chat_id,
-        source_whatsapp_message_id, issue_id, issue_chat_id, display_name,
+        source_whatsapp_message_id, source_sender_jid, source_sent_at,
+        capture_message_id, capture_whatsapp_message_id,
+        issue_id, issue_chat_id, display_name,
         declared_mime, media_whatsapp_message_id, detected_mime, size_bytes, sha256,
         storage_key, retention_class, processing_status, extracted_text, parse_error,
         created_at, updated_at
       ) VALUES (
         @attachmentUid, @idempotencyKey, @chatId, @messageId, @messageChatId,
-        @sourceWhatsappMessageId, @issueId, @issueChatId, @displayName,
+        @sourceWhatsappMessageId, @sourceSenderJid, @sourceSentAt,
+        @captureMessageId, @captureWhatsappMessageId,
+        @issueId, @issueChatId, @displayName,
         @declaredMime, @mediaWhatsappMessageId, @detectedMime, @sizeBytes, @sha256,
         @storageKey, @retentionClass,
         @processingStatus, @extractedText, @parseError, @now, @now
@@ -115,7 +138,10 @@ class AttachmentRepository {
       issue_id: values.issueId,
       display_name: values.displayName,
       size_bytes: values.sizeBytes,
-    }, ['message_id', 'issue_id', 'display_name', 'size_bytes'], 'attachment');
+      source_whatsapp_message_id: values.sourceWhatsappMessageId,
+      capture_message_id: values.captureMessageId,
+    }, ['message_id', 'issue_id', 'display_name', 'size_bytes',
+      'source_whatsapp_message_id', 'capture_message_id'], 'attachment');
     return { record: existing, created: false };
   }
 
@@ -150,7 +176,7 @@ class AttachmentRepository {
       WHERE a.issue_id = ? AND a.deleted_at IS NULL AND a.retryable = 1
         AND (
           a.processing_status = 'FAILED'
-          OR (a.processing_status = 'PENDING' AND a.processing_claim_id IS NULL)
+          OR (a.processing_status IN ('PENDING', 'UNPARSED') AND a.processing_claim_id IS NULL)
           OR (a.processing_status = 'PROCESSING' AND a.processing_lease_until <= ?)
         )
       ORDER BY a.id
@@ -203,8 +229,10 @@ class AttachmentRepository {
       `).run(values);
       this.db.prepare(`
         UPDATE attachments
-        SET processing_status = 'PENDING', processing_claim_id = NULL,
-            processing_lease_until = NULL, last_error_code = 'STALE_PROCESSING',
+        SET processing_status = CASE WHEN blob_sha256 IS NULL THEN 'PENDING' ELSE 'FAILED' END,
+            parse_status = CASE WHEN parse_status = 'PARSING' THEN 'FAILED' ELSE parse_status END,
+            processing_claim_id = NULL, processing_lease_until = NULL,
+            last_error_code = 'STALE_PROCESSING',
             parse_error = 'Interrupted attachment processing was recovered for retry',
             retryable = 1, updated_at = @now
         WHERE deleted_at IS NULL AND processing_status = 'PROCESSING'
@@ -217,7 +245,7 @@ class AttachmentRepository {
       this.db.prepare(`
         UPDATE attachments
         SET processing_claim_id = NULL, processing_lease_until = NULL, updated_at = @now
-        WHERE deleted_at IS NULL AND processing_status = 'PENDING'
+        WHERE deleted_at IS NULL AND processing_status IN ('PENDING', 'UNPARSED')
           AND processing_claim_id IS NOT NULL
           AND processing_claim_id NOT IN (SELECT value FROM json_each(@activeClaimsJson))
       `).run(values);
@@ -227,10 +255,17 @@ class AttachmentRepository {
         JOIN chats c ON c.id = a.chat_id
         LEFT JOIN attachment_blobs b ON b.sha256 = a.blob_sha256
         WHERE a.deleted_at IS NULL
-          AND a.processing_status IN ('PENDING', 'FAILED')
           AND a.retryable = 1 AND a.processing_claim_id IS NULL
-          AND COALESCE(a.media_whatsapp_message_id,
-          a.source_whatsapp_message_id) IS NOT NULL
+          AND (
+            (a.blob_sha256 IS NOT NULL
+              AND a.parse_status IN ('PENDING', 'FAILED')
+              AND a.detected_extension IN ('md', 'txt', 'pdf', 'docx'))
+            OR
+            (a.blob_sha256 IS NULL
+              AND a.processing_status IN ('PENDING', 'FAILED')
+              AND COALESCE(a.media_whatsapp_message_id,
+                a.source_whatsapp_message_id) IS NOT NULL)
+          )
         ORDER BY a.id
       `).all().map(hydrateBlob);
       const lease = this.db.prepare(`
@@ -254,6 +289,8 @@ class AttachmentRepository {
         && (current.processing_lease_until === null || current.processing_lease_until <= now);
       const eligible = current.processing_status === 'FAILED'
         || (current.processing_status === 'PENDING' && current.processing_claim_id === null)
+        || (current.processing_status === 'UNPARSED' && current.parse_status === 'PENDING'
+          && current.processing_claim_id === null)
         || stale;
       if (!eligible) return null;
       if (stale) {
@@ -267,7 +304,16 @@ class AttachmentRepository {
       }
       return this.db.prepare(`
         UPDATE attachments
-        SET processing_status = 'PENDING', processing_claim_id = @claimId,
+        SET processing_status = CASE WHEN blob_sha256 IS NULL THEN 'PENDING' ELSE 'UNPARSED' END,
+            parse_status = CASE
+              WHEN blob_sha256 IS NULL THEN NULL
+              WHEN parse_status IN ('FAILED', 'PARSING') THEN 'PENDING'
+              ELSE parse_status
+            END,
+            extracted_text = CASE WHEN parse_status = 'PARSED' THEN extracted_text ELSE NULL END,
+            extracted_char_count = CASE WHEN parse_status = 'PARSED' THEN extracted_char_count ELSE NULL END,
+            extraction_truncated = CASE WHEN parse_status = 'PARSED' THEN extraction_truncated ELSE 0 END,
+            retryable = 1, processing_claim_id = @claimId,
             processing_lease_until = NULL, parse_error = NULL,
             last_error_code = NULL, updated_at = @now
         WHERE id = @attachmentId AND deleted_at IS NULL
@@ -279,10 +325,12 @@ class AttachmentRepository {
   markAdmissionFailed(input) {
     return this.db.prepare(`
       UPDATE attachments
-      SET processing_status = 'FAILED', processing_claim_id = NULL,
-          processing_lease_until = NULL, parse_error = @message,
+      SET processing_status = 'FAILED',
+          parse_status = CASE WHEN blob_sha256 IS NULL THEN NULL ELSE 'FAILED' END,
+          extracted_text = NULL, extracted_char_count = NULL, extraction_truncated = 0,
+          processing_claim_id = NULL, processing_lease_until = NULL, parse_error = @message,
           last_error_code = @code, retryable = @retryable, updated_at = @now
-      WHERE id = @attachmentId AND processing_status = 'PENDING'
+      WHERE id = @attachmentId AND processing_status IN ('PENDING', 'UNPARSED')
         AND processing_claim_id = @claimId
       RETURNING *
     `).get({
@@ -315,8 +363,10 @@ class AttachmentRepository {
   setPending(id, now) {
     return this.db.prepare(`
       UPDATE attachments
-      SET processing_status = 'PENDING', parse_error = NULL,
-          last_error_code = NULL, processing_claim_id = NULL,
+      SET processing_status = CASE WHEN blob_sha256 IS NULL THEN 'PENDING' ELSE 'UNPARSED' END,
+          parse_status = CASE WHEN blob_sha256 IS NULL THEN NULL ELSE 'PENDING' END,
+          extracted_text = NULL, extracted_char_count = NULL, extraction_truncated = 0,
+          parse_error = NULL, last_error_code = NULL, processing_claim_id = NULL,
           processing_lease_until = NULL, updated_at = ?
       WHERE id = ? AND deleted_at IS NULL AND retryable = 1
       RETURNING *
@@ -375,7 +425,16 @@ class AttachmentRepository {
       if (values.directClaim) {
         this.db.prepare(`
           UPDATE attachments
-          SET processing_status = 'PENDING', processing_claim_id = @claimId,
+          SET processing_status = CASE WHEN blob_sha256 IS NULL THEN 'PENDING' ELSE 'UNPARSED' END,
+              parse_status = CASE
+                WHEN blob_sha256 IS NULL THEN NULL
+                WHEN @operation = 'EXTRACT' THEN 'PENDING'
+                ELSE parse_status
+              END,
+              extracted_text = CASE WHEN @operation = 'EXTRACT' THEN NULL ELSE extracted_text END,
+              extracted_char_count = CASE WHEN @operation = 'EXTRACT' THEN NULL ELSE extracted_char_count END,
+              extraction_truncated = CASE WHEN @operation = 'EXTRACT' THEN 0 ELSE extraction_truncated END,
+              processing_claim_id = @claimId,
               processing_lease_until = NULL, retryable = 1, updated_at = @now
           WHERE id = @attachmentId AND deleted_at IS NULL
             AND processing_status <> 'PROCESSING'
@@ -384,11 +443,13 @@ class AttachmentRepository {
       const allocated = this.db.prepare(`
         UPDATE attachments
         SET next_attempt_number = next_attempt_number + 1,
-            processing_status = 'PROCESSING', parse_error = NULL,
-            last_error_code = NULL, processing_lease_until = @leaseUntil,
-            updated_at = @now
+            processing_status = 'PROCESSING',
+            parse_status = CASE WHEN @operation = 'EXTRACT' THEN 'PARSING' ELSE parse_status END,
+            parse_error = NULL, last_error_code = NULL,
+            processing_lease_until = @leaseUntil, updated_at = @now
         WHERE id = @attachmentId AND deleted_at IS NULL
-          AND processing_status = 'PENDING' AND processing_claim_id = @claimId
+          AND processing_status IN ('PENDING', 'UNPARSED')
+          AND processing_claim_id = @claimId
         RETURNING next_attempt_number - 1 AS attempt_number
       `).get(values);
       if (!allocated) throw new Error('Attachment queue claim is no longer active');
@@ -428,7 +489,14 @@ class AttachmentRepository {
       const attachmentStatus = status === 'SUCCEEDED'
         ? enumValue(input.attachmentStatus || 'READY', 'attachmentStatus', PROCESSING_STATUSES)
         : 'FAILED';
-      const retryable = status === 'FAILED' ? (input.retryable === false ? 0 : 1) : 0;
+      const parseStatus = attempt.operation === 'EXTRACT'
+        ? (status === 'FAILED'
+          ? 'FAILED'
+          : enumValue(input.parseStatus || 'PARSED', 'parseStatus', PARSE_STATUSES))
+        : null;
+      const retryable = status === 'FAILED'
+        ? (input.retryable === false ? 0 : 1)
+        : (input.retryable === true ? 1 : 0);
       this.db.prepare(`
         UPDATE attachment_processing_attempts
         SET retryable = @retryable, metadata_json = @metadataJson
@@ -441,7 +509,10 @@ class AttachmentRepository {
       const attachment = this.db.prepare(`
         UPDATE attachments
         SET processing_status = @attachmentStatus,
-            extracted_text = COALESCE(@extractedText, extracted_text),
+            parse_status = COALESCE(@parseStatus, parse_status),
+            extracted_text = CASE WHEN @parseStatus = 'PARSED' THEN @extractedText ELSE NULL END,
+            extracted_char_count = CASE WHEN @parseStatus = 'PARSED' THEN length(@extractedText) ELSE NULL END,
+            extraction_truncated = CASE WHEN @parseStatus = 'PARSED' THEN @truncated ELSE 0 END,
             parse_error = @parseError, last_error_code = @errorCode,
             retryable = @retryable, processing_claim_id = NULL,
             processing_lease_until = NULL, updated_at = @now
@@ -450,11 +521,13 @@ class AttachmentRepository {
         attachmentId: attempt.attachment_id,
         claimId: attempt.processing_claim_id,
         attachmentStatus,
+        parseStatus,
         extractedText: input.extractedText == null ? null : String(input.extractedText),
-        parseError: status === 'FAILED'
-          ? (input.errorMessage == null ? 'Processing failed' : String(input.errorMessage))
+        truncated: input.truncated === true ? 1 : 0,
+        parseError: (status === 'FAILED' || input.errorMessage != null)
+          ? String(input.errorMessage || 'Processing failed').slice(0, 2000)
           : null,
-        errorCode: status === 'FAILED'
+        errorCode: (status === 'FAILED' || input.errorCode != null)
           ? (optionalString(input.errorCode, 'errorCode', { max: 100 }) || 'PROCESSING_FAILED')
           : null,
         retryable,
@@ -478,6 +551,7 @@ class AttachmentRepository {
       detectedExtension: requireString(input.detectedExtension, 'detectedExtension', { max: 16 }),
       retentionClass: requireString(input.retentionClass || 'TEMPORARY', 'retentionClass', { max: 20 }).toUpperCase(),
       displayName: requireString(input.displayName, 'displayName', { max: 1000 }),
+      extractionEligible: input.extractionEligible === true ? 1 : 0,
       metadataJson: input.metadata == null ? null : JSON.stringify(input.metadata),
       now: requireTimestamp(input.now, 'now'),
     };
@@ -517,8 +591,10 @@ class AttachmentRepository {
             sha256 = @sha256, blob_sha256 = @sha256, storage_key = NULL,
             duplicate_of_attachment_id = @duplicateId,
             downloaded_at = @now, archived_at = @now,
-            processing_status = 'UNPARSED', parse_error = NULL,
-            last_error_code = NULL, retryable = 0,
+            processing_status = 'UNPARSED',
+            parse_status = CASE WHEN @extractionEligible = 1 THEN 'PENDING' ELSE 'NOT_APPLICABLE' END,
+            parse_error = NULL, last_error_code = NULL,
+            retryable = @extractionEligible,
             processing_claim_id = NULL, processing_lease_until = NULL,
             updated_at = @now
         WHERE id = @attachmentId AND processing_claim_id = @claimId
@@ -576,7 +652,13 @@ class AttachmentRepository {
             detected_extension = @detectedExtension, size_bytes = @sizeBytes,
             sha256 = @sha256, blob_sha256 = @sha256, storage_key = NULL,
             duplicate_of_attachment_id = NULL, downloaded_at = @now,
-            archived_at = @now, updated_at = @now
+            archived_at = @now, processing_status = 'UNPARSED',
+            parse_status = CASE WHEN @detectedExtension IN ('md', 'txt', 'pdf', 'docx')
+              THEN 'PENDING' ELSE 'NOT_APPLICABLE' END,
+            retryable = CASE WHEN @detectedExtension IN ('md', 'txt', 'pdf', 'docx')
+              THEN 1 ELSE 0 END,
+            processing_claim_id = NULL, processing_lease_until = NULL,
+            updated_at = @now
         WHERE id = @attachmentId AND deleted_at IS NULL RETURNING *
       `).get(values);
     });
@@ -602,7 +684,13 @@ class AttachmentRepository {
           detected_extension = @detectedExtension, size_bytes = @sizeBytes,
           sha256 = @sha256, blob_sha256 = @sha256, storage_key = NULL,
           duplicate_of_attachment_id = @duplicateOfAttachmentId,
-          downloaded_at = @now, archived_at = @now, updated_at = @now
+          downloaded_at = @now, archived_at = @now, processing_status = 'UNPARSED',
+          parse_status = CASE WHEN @detectedExtension IN ('md', 'txt', 'pdf', 'docx')
+            THEN 'PENDING' ELSE 'NOT_APPLICABLE' END,
+          retryable = CASE WHEN @detectedExtension IN ('md', 'txt', 'pdf', 'docx')
+            THEN 1 ELSE 0 END,
+          processing_claim_id = NULL, processing_lease_until = NULL,
+          updated_at = @now
       WHERE id = @attachmentId AND deleted_at IS NULL RETURNING *
     `).get(values) || null;
   }
@@ -722,7 +810,9 @@ class AttachmentRepository {
       this.db.prepare(`
         UPDATE attachments
         SET blob_sha256 = NULL, sha256 = NULL, duplicate_of_attachment_id = NULL,
-            processing_status = 'FAILED', last_error_code = 'ARCHIVE_MISSING',
+            processing_status = 'FAILED', parse_status = NULL,
+            extracted_text = NULL, extracted_char_count = NULL, extraction_truncated = 0,
+            last_error_code = 'ARCHIVE_MISSING',
             parse_error = 'Archived blob is missing; source media may be retried',
             retryable = CASE WHEN COALESCE(media_whatsapp_message_id,
               source_whatsapp_message_id) IS NULL THEN 0 ELSE 1 END,
@@ -790,6 +880,52 @@ class AttachmentRepository {
     });
   }
 
+  purgeExpiredTemporary(cutoff, now = Date.now()) {
+    const expiresBefore = requireTimestamp(cutoff, 'cutoff');
+    const timestamp = requireTimestamp(now, 'now');
+    return immediate(this.db, () => {
+      const candidates = this.db.prepare(`
+        SELECT id, blob_sha256 FROM attachments
+        WHERE retention_class = 'TEMPORARY' AND issue_id IS NULL
+          AND deleted_at IS NULL AND processing_status <> 'PROCESSING'
+          AND COALESCE(source_sent_at, archived_at, created_at) < @cutoff
+        ORDER BY id
+      `).all({ cutoff: expiresBefore });
+      if (candidates.length === 0) return { attachmentIds: [], blobs: [] };
+      const ids = candidates.map((row) => row.id);
+      const idsJson = JSON.stringify(ids);
+      const hashes = [...new Set(candidates.map((row) => row.blob_sha256).filter(Boolean))];
+      this.db.prepare(`
+        DELETE FROM attachment_processing_attempts
+        WHERE attachment_id IN (SELECT value FROM json_each(?))
+      `).run(idsJson);
+      this.db.prepare(`
+        UPDATE attachments SET duplicate_of_attachment_id = NULL, updated_at = ?
+        WHERE duplicate_of_attachment_id IN (SELECT value FROM json_each(?))
+          AND id NOT IN (SELECT value FROM json_each(?))
+      `).run(timestamp, idsJson, idsJson);
+      this.db.prepare(`
+        DELETE FROM attachments WHERE id IN (SELECT value FROM json_each(?))
+      `).run(idsJson);
+
+      const blobs = [];
+      for (const hash of hashes) {
+        const referenced = this.db.prepare(
+          'SELECT 1 FROM attachments WHERE blob_sha256 = ? LIMIT 1'
+        ).get(hash);
+        if (referenced) continue;
+        const blob = this.db.prepare(`
+          DELETE FROM attachment_blobs
+          WHERE sha256 = ? AND retention_class = 'TEMPORARY'
+            AND promotion_target_key IS NULL
+          RETURNING *
+        `).get(hash);
+        if (blob) blobs.push(blob);
+      }
+      return { attachmentIds: ids, blobs };
+    });
+  }
+
   recomputeBlobRetention(sha, now) {
     const hash = sha256(sha);
     const timestamp = requireTimestamp(now, 'now');
@@ -814,4 +950,9 @@ class AttachmentRepository {
   }
 }
 
-module.exports = { ATTEMPT_OPERATIONS, AttachmentRepository, PROCESSING_STATUSES };
+module.exports = {
+  ATTEMPT_OPERATIONS,
+  AttachmentRepository,
+  PARSE_STATUSES,
+  PROCESSING_STATUSES,
+};

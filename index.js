@@ -139,6 +139,7 @@ const attachmentService = new AttachmentService({
   queue: attachmentQueue,
   adapter: whatsappAdapter,
   limits: config.storage,
+  temporaryRetentionDays: config.retention.messageDays,
   clock: appClock,
 });
 const pmHandlers = createPmCommandHandlers({

@@ -260,6 +260,65 @@ class MessageRepository {
     `).all(id, windowStart, windowEnd);
   }
 
+  listSummarySourcesWindow(chatId, start, end, options = {}) {
+    const id = requireInteger(chatId, 'chatId', { min: 1 });
+    const windowStart = requireTimestamp(start, 'start');
+    const windowEnd = requireTimestamp(end, 'end');
+    if (windowEnd <= windowStart) throw new RangeError('end must be greater than start');
+    const includeCommands = options.includeCommands === true;
+    const messages = this.listWindow(id, windowStart, windowEnd, {
+      includeCommands,
+      includeTombstones: false,
+    });
+    const markdownAttachments = this.db.prepare(`
+      SELECT
+        a.id AS attachment_id,
+        a.attachment_uid,
+        a.message_id,
+        a.capture_message_id,
+        a.capture_whatsapp_message_id,
+        a.source_whatsapp_message_id AS whatsapp_message_id,
+        a.source_sent_at AS sent_at,
+        a.source_sender_jid AS sender_jid,
+        sm.sender_display_name AS sender_display_name,
+        m.sender_display_name AS capture_sender_display_name,
+        a.display_name,
+        a.retention_class,
+        a.processing_status,
+        COALESCE(a.parse_status,
+          CASE
+            WHEN a.processing_status = 'READY' AND a.extracted_text IS NOT NULL THEN 'PARSED'
+            WHEN a.processing_status = 'FAILED' THEN 'FAILED'
+            ELSE 'PENDING'
+          END
+        ) AS parse_status,
+        a.extracted_text,
+        a.extracted_char_count,
+        a.extraction_truncated,
+        a.parse_error,
+        a.last_error_code,
+        a.created_at AS attachment_created_at
+      FROM attachments a
+      JOIN messages m ON m.id = a.capture_message_id AND m.chat_id = a.chat_id
+      LEFT JOIN messages sm ON sm.chat_id = a.chat_id
+        AND sm.whatsapp_message_id = a.source_whatsapp_message_id
+      WHERE m.chat_id = @chatId
+        AND a.source_sent_at >= @windowStart AND a.source_sent_at < @windowEnd
+        AND m.is_tombstone = 0 AND a.deleted_at IS NULL
+        ${includeCommands ? '' : 'AND m.is_command = 0'}
+        AND (
+          a.detected_extension = 'md'
+          OR lower(a.display_name) GLOB '*.md'
+          OR lower(a.display_name) GLOB '*.markdown'
+          OR lower(COALESCE(a.declared_mime, '')) IN (
+            'text/markdown', 'text/x-markdown'
+          )
+        )
+      ORDER BY m.sent_at, m.id, a.id
+    `).all({ chatId: id, windowStart, windowEnd });
+    return { messages, markdownAttachments };
+  }
+
   updateBody(id, body) {
     const value = body === null ? null : String(body);
     return this.db.prepare(`

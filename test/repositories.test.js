@@ -89,7 +89,7 @@ test('domain migration creates strict tables, composite-reference indexes, guard
   `).all().map((row) => row.name);
   for (const table of expectedTables) assert.ok(tables.includes(table), `${table} should exist`);
   assert.ok(tables.includes('issue_fts'));
-  assert.equal(db.pragma('user_version', { simple: true }), 5);
+  assert.equal(db.pragma('user_version', { simple: true }), 6);
   assert.deepEqual(db.pragma('foreign_key_check'), []);
   assert.deepEqual(
     db.prepare("SELECT name, next_value, updated_at FROM sequences WHERE name='issue_tv'").get(),
@@ -538,7 +538,7 @@ test('attachments derive chat/source identity, reject cross-chat links, and numb
   const created = repositories.attachments.create({
     attachmentUid: 'attachment-one', idempotencyKey: 'wa-file-one',
     messageId: message.id, displayName: 'proof.md', detectedMime: 'text/markdown',
-    sizeBytes: 12, sha256: 'a'.repeat(64), storageKey: 'tmp/one', now: 2100,
+    sizeBytes: 12, now: 2100,
   });
   assert.equal(created.record.chat_id, chatOne.id);
   assert.equal(created.record.source_whatsapp_message_id, message.whatsapp_message_id);
@@ -550,33 +550,62 @@ test('attachments derive chat/source identity, reject cross-chat links, and numb
     'UPDATE attachments SET source_whatsapp_message_id = ? WHERE id = ?'
   ).run('changed', created.record.id), /immutable/);
 
-  const attempt = repositories.attachments.startAttempt({
-    attemptUid: 'attempt-one', idempotencyKey: 'extract-one',
-    attachmentId: created.record.id, operation: 'EXTRACT', now: 2300,
+  // Exercise the legal lifecycle rather than bypassing strict extraction
+  // states: DOWNLOAD archives bytes, then EXTRACT parses those bytes.
+  const download = repositories.attachments.startAttempt({
+    attemptUid: 'attempt-download', idempotencyKey: 'download-one',
+    attachmentId: created.record.id, operation: 'DOWNLOAD', now: 2300,
   });
-  assert.equal(attempt.record.attempt_number, 1);
-  assert.equal(repositories.attachments.startAttempt({
-    idempotencyKey: 'extract-one', attachmentId: created.record.id,
-    operation: 'EXTRACT', now: 2301,
-  }).record.attempt_number, 1);
-  repositories.attachments.completeAttempt({
-    attemptId: attempt.record.id, status: 'SUCCEEDED', attachmentStatus: 'READY',
-    extractedText: 'parsed markdown', now: 2400,
+  assert.equal(download.record.attempt_number, 1);
+  repositories.attachments.finalizeProcessingSuccess({
+    attemptId: download.record.id,
+    attachmentId: created.record.id,
+    sha256: 'a'.repeat(64),
+    storageKey: 'issues/one/proof.md',
+    sizeBytes: 12,
+    detectedMime: 'text/markdown',
+    detectedExtension: 'md',
+    displayName: 'proof.md',
+    retentionClass: 'ISSUE',
+    extractionEligible: true,
+    now: 2350,
   });
-  assert.throws(() => repositories.attachments.completeAttempt({
-    attemptId: attempt.record.id, status: 'FAILED', now: 2401,
-  }), /not active/);
+  const unparsed = repositories.attachments.findById(created.record.id);
+  assert.equal(unparsed.processing_status, 'UNPARSED');
+  assert.equal(unparsed.parse_status, 'PENDING');
+
   assert.throws(() => repositories.transaction(() => {
     repositories.attachments.startAttempt({
       attemptUid: 'attempt-rollback', idempotencyKey: 'extract-rollback',
-      attachmentId: created.record.id, operation: 'OCR', now: 2500,
+      attachmentId: created.record.id, operation: 'EXTRACT', now: 2390,
     });
     throw new Error('rollback attempt');
   }), /rollback attempt/);
+
+  const attempt = repositories.attachments.startAttempt({
+    attemptUid: 'attempt-one', idempotencyKey: 'extract-one',
+    attachmentId: created.record.id, operation: 'EXTRACT', now: 2400,
+  });
+  assert.equal(attempt.record.attempt_number, 2);
   assert.equal(repositories.attachments.startAttempt({
-    attemptUid: 'attempt-two', idempotencyKey: 'extract-two',
-    attachmentId: created.record.id, operation: 'OCR', now: 2600,
+    idempotencyKey: 'extract-one', attachmentId: created.record.id,
+    operation: 'EXTRACT', now: 2401,
   }).record.attempt_number, 2);
+  repositories.attachments.completeAttempt({
+    attemptId: attempt.record.id, status: 'SUCCEEDED', attachmentStatus: 'READY',
+    parseStatus: 'PARSED', extractedText: 'parsed markdown', now: 2500,
+  });
+  const parsed = repositories.attachments.findById(created.record.id);
+  assert.equal(parsed.processing_status, 'READY');
+  assert.equal(parsed.parse_status, 'PARSED');
+  assert.throws(() => repositories.attachments.completeAttempt({
+    attemptId: attempt.record.id, status: 'FAILED', now: 2501,
+  }), /not active/);
+  assert.deepEqual(
+    repositories.attachments.listAttempts(created.record.id)
+      .map((row) => [row.operation, row.attempt_number]),
+    [['DOWNLOAD', 1], ['EXTRACT', 2]]
+  );
   assert.deepEqual(db.pragma('foreign_key_check'), []);
 });
 

@@ -132,6 +132,9 @@ function loadConfig(env = process.env) {
       // Parsing/OCR tasks consume these centralized resource ceilings. Task 8
       // already enforces byte, image-header, DOCX ZIP and wall-clock limits.
       maxPdfPages: readInteger(env, 'PM_MAX_PDF_PAGES', 100),
+      maxPdfTextItems: readInteger(env, 'PM_MAX_PDF_TEXT_ITEMS', 500_000),
+      maxExtractedItems: readInteger(env, 'PM_MAX_EXTRACTED_ITEMS', 500_000),
+      parserMaxOldSpaceMb: readInteger(env, 'PM_PARSER_MAX_OLD_SPACE_MB', 128),
       maxImagePixels: readInteger(env, 'PM_MAX_IMAGE_PIXELS', 40_000_000),
       maxDocxUncompressedBytes: readInteger(
         env,
@@ -234,6 +237,9 @@ function validateConfig(config, { requirePm = true } = {}) {
   integerInRange(config.database.busyTimeoutMs, 0, 120000, 'DB_BUSY_TIMEOUT_MS');
   integerInRange(config.storage.maxFileMb, 1, 100, 'PM_MAX_FILE_MB');
   integerInRange(config.storage.maxPdfPages, 1, 10000, 'PM_MAX_PDF_PAGES');
+  integerInRange(config.storage.maxPdfTextItems, 1, 100_000_000, 'PM_MAX_PDF_TEXT_ITEMS');
+  integerInRange(config.storage.maxExtractedItems, 1, 100_000_000, 'PM_MAX_EXTRACTED_ITEMS');
+  integerInRange(config.storage.parserMaxOldSpaceMb, 16, 2048, 'PM_PARSER_MAX_OLD_SPACE_MB');
   integerInRange(config.storage.maxImagePixels, 1, 1_000_000_000, 'PM_MAX_IMAGE_PIXELS');
   if (!Number.isSafeInteger(config.storage.maxDocxUncompressedBytes)
       || config.storage.maxDocxUncompressedBytes < 1024 * 1024

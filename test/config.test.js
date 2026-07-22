@@ -27,6 +27,9 @@ test('loads valid PM defaults and normalizes JIDs', () => {
   assert.deepEqual(config.pm.adminJids, ['60222222222@c.us', '60333333333@lid']);
   assert.equal(config.storage.maxFileBytes, 20 * 1024 * 1024);
   assert.equal(config.storage.maxPdfPages, 100);
+  assert.equal(config.storage.maxPdfTextItems, 500_000);
+  assert.equal(config.storage.maxExtractedItems, 500_000);
+  assert.equal(config.storage.parserMaxOldSpaceMb, 128);
   assert.equal(config.storage.maxImagePixels, 40_000_000);
   assert.equal(config.storage.maxDocxUncompressedBytes, 100 * 1024 * 1024);
   assert.equal(config.storage.maxExtractedChars, 1_000_000);
@@ -70,6 +73,9 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
     PM_ADMIN_JIDS: 'not a jid',
     PM_MAX_FILE_MB: '20MB',
     PM_MAX_PDF_PAGES: '0',
+    PM_MAX_PDF_TEXT_ITEMS: '0',
+    PM_MAX_EXTRACTED_ITEMS: 'many',
+    PM_PARSER_MAX_OLD_SPACE_MB: '8',
     PM_MAX_IMAGE_PIXELS: 'many',
     PM_MAX_DOCX_UNCOMPRESSED_MB: '0',
     PM_MAX_EXTRACTED_CHARS: '-1',
@@ -91,6 +97,9 @@ test('rejects malformed JIDs, NaN-like numbers, bad ranges, and invalid policies
       assert.match(error.message, /PM_ADMIN_JIDS/);
       assert.match(error.message, /PM_MAX_FILE_MB/);
       assert.match(error.message, /PM_MAX_PDF_PAGES/);
+      assert.match(error.message, /PM_MAX_PDF_TEXT_ITEMS/);
+      assert.match(error.message, /PM_MAX_EXTRACTED_ITEMS/);
+      assert.match(error.message, /PM_PARSER_MAX_OLD_SPACE_MB/);
       assert.match(error.message, /PM_MAX_IMAGE_PIXELS/);
       assert.match(error.message, /PM_MAX_DOCX_UNCOMPRESSED_MB/);
       assert.match(error.message, /PM_MAX_EXTRACTED_CHARS/);

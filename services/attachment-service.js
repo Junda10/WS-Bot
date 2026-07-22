@@ -9,6 +9,8 @@ const {
 } = require('./attachment-type');
 const { AttachmentStorageError } = require('./attachment-storage');
 const { AttachmentPreflightProcessor } = require('./attachment-preflight-processor');
+const { AttachmentExtractionProcessor } = require('./attachment-extraction-processor');
+const { EXTRACTABLE_KINDS } = require('./attachment-extractors');
 const { MediaDownloadError } = require('../whatsapp/adapter');
 
 class AttachmentProcessingError extends Error {
@@ -124,7 +126,16 @@ class AttachmentService {
     if (typeof this.processor.process !== 'function') {
       throw new TypeError('Attachment processor must provide process(buffer, metadata, limits, options)');
     }
+    this.extractor = options.extractor || new AttachmentExtractionProcessor();
+    if (typeof this.extractor.process !== 'function') {
+      throw new TypeError('Attachment extractor must provide process(buffer, metadata, limits, options)');
+    }
     this.limits = Object.freeze({ ...options.limits });
+    this.temporaryRetentionDays = options.temporaryRetentionDays ?? 30;
+    if (!Number.isSafeInteger(this.temporaryRetentionDays)
+        || this.temporaryRetentionDays < 1 || this.temporaryRetentionDays > 3650) {
+      throw new TypeError('temporaryRetentionDays must be an integer from 1 to 3650');
+    }
     this.clock = options.clock || Date.now;
     this.logger = options.logger || console;
     this.enqueued = new Map();
@@ -250,6 +261,9 @@ class AttachmentService {
       idempotencyKey: `${input.normalized.id}:quoted-media:${quoted.id}`,
       messageId: commandMessageId,
       issueId: input.issueId,
+      sourceWhatsappMessageId: quoted.id,
+      sourceSenderJid: quoted.senderJid ?? null,
+      sourceSentAt: quoted.sentAt ?? null,
       mediaWhatsappMessageId: quoted.id,
       displayName: sanitizeDisplayName(metadata.fileName),
       declaredMime: metadata.mimeType,
@@ -307,16 +321,95 @@ class AttachmentService {
     };
   }
 
+  async _extractArchived(input) {
+    const attachment = this.repositories.attachments.findById(input.attachmentId);
+    if (!attachment?.blob_sha256 || !attachment.storage_key) {
+      throw new AttachmentProcessingError('ATTACHMENT_UNAVAILABLE', 'Archived attachment bytes are unavailable');
+    }
+    const kind = input.kind || ({ md: 'markdown', txt: 'text', pdf: 'pdf', docx: 'docx' })[
+      attachment.detected_extension
+    ];
+    if (!EXTRACTABLE_KINDS.has(kind)) return { attachment, extraction: null, attempt: null };
+
+    const claimId = input.claimId || crypto.randomUUID();
+    // Finalizing DOWNLOAD intentionally clears its claim. Re-acquire the
+    // archive with the same queue claim so recoverPending() continues to see
+    // the currently executing extraction as active rather than stale work.
+    if (attachment.processing_claim_id !== claimId) {
+      const claimed = this.repositories.attachments.claimForQueue({
+        attachmentId: attachment.id,
+        claimId,
+        now: this.now(),
+      });
+      if (!claimed) {
+        throw new AttachmentProcessingError(
+          'ATTACHMENT_NOT_RECOVERABLE',
+          'Archived attachment could not be claimed for extraction'
+        );
+      }
+    }
+    const startedAt = this.now();
+    const leaseUntil = startedAt + this.limits.processingTimeoutMs + 5000;
+    const attempt = this.repositories.attachments.startAttempt({
+      attachmentId: attachment.id,
+      operation: 'EXTRACT',
+      claimId,
+      leaseUntil,
+      idempotencyKey: `attachment:${attachment.id}:extract:${claimId}`,
+      now: startedAt,
+    }).record;
+    input.setActiveAttempt(attempt);
+    this._scheduleRecoveryAt(leaseUntil);
+    throwIfAborted(input.signal);
+    const filePath = this.storage.resolve(attachment.storage_key);
+    throwIfAborted(input.signal);
+    const extraction = await this.extractor.process(filePath, {
+      kind,
+      displayName: attachment.display_name,
+      attachmentId: attachment.id,
+      messageId: attachment.message_id,
+      sourceWhatsappMessageId: attachment.source_whatsapp_message_id,
+    }, this.limits, { signal: input.signal });
+    throwIfAborted(input.signal);
+    const parsed = extraction.status === 'PARSED';
+    const completed = this.repositories.attachments.completeAttempt({
+      attemptId: attempt.id,
+      status: 'SUCCEEDED',
+      attachmentStatus: parsed ? 'READY' : 'UNPARSED',
+      parseStatus: extraction.status,
+      extractedText: extraction.text,
+      truncated: extraction.metadata?.truncated === true
+        || extraction.metadata?.sourceTruncated === true,
+      errorCode: extraction.errorCode,
+      errorMessage: extraction.errorMessage,
+      retryable: extraction.retryable,
+      metadata: extraction.metadata,
+      now: this.now(),
+    });
+    input.setActiveAttempt(null);
+    return { ...completed, extraction };
+  }
+
   async _process(attachmentId, claimId, downloader) {
     let attempt = null;
     let stage = null;
     let committed = null;
+    let archiveFinalized = false;
+    let duplicateOrphanStorageKey = null;
     try {
       const result = await withTimeout(async (signal) => {
-        const attachment = this.repositories.attachments.findById(attachmentId);
+        let attachment = this.repositories.attachments.findById(attachmentId);
         if (!attachment) {
           throw new AttachmentProcessingError('ATTACHMENT_NOT_FOUND', 'Attachment no longer exists');
         }
+        // Restart/retry after a successful archive never downloads media again.
+        if (attachment.blob_sha256 && attachment.storage_key) {
+          return this._extractArchived({
+            attachmentId, claimId, signal,
+            setActiveAttempt: (value) => { attempt = value; },
+          });
+        }
+
         const startedAt = this.now();
         const leaseUntil = startedAt + this.limits.processingTimeoutMs + 5000;
         attempt = this.repositories.attachments.startAttempt({
@@ -357,6 +450,7 @@ class AttachmentService {
         });
         stage = null;
         throwIfAborted(signal);
+        const extractionEligible = EXTRACTABLE_KINDS.has(preflight.detected.kind);
         const finalized = this.repositories.attachments.finalizeProcessingSuccess({
           attemptId: attempt.id,
           attachmentId,
@@ -367,6 +461,7 @@ class AttachmentService {
           detectedExtension: preflight.detected.extension,
           displayName,
           retentionClass: attachment.issue_id ? 'ISSUE' : 'TEMPORARY',
+          extractionEligible,
           metadata: {
             detectedKind: preflight.detected.kind,
             imagePixels: preflight.detected.pixels ?? null,
@@ -374,6 +469,9 @@ class AttachmentService {
           },
           now: this.now(),
         });
+        archiveFinalized = true;
+        duplicateOrphanStorageKey = finalized.orphanStorageKey;
+        attempt = null;
         if (attachment.issue_id && /^temporary[\\/]/u.test(finalized.blob.storage_key)) {
           await this._promoteBlobForAttachment({
             attachmentId,
@@ -382,14 +480,17 @@ class AttachmentService {
           });
           finalized.blob = this.repositories.attachments.findBlob(preflight.sha256);
         }
-        return { ...finalized, detected: preflight.detected };
+        if (!extractionEligible) return { ...finalized, detected: preflight.detected };
+        const extracted = await this._extractArchived({
+          attachmentId,
+          kind: preflight.detected.kind,
+          claimId,
+          signal,
+          setActiveAttempt: (value) => { attempt = value; },
+        });
+        return { ...finalized, ...extracted, detected: preflight.detected };
       }, this.limits.processingTimeoutMs);
 
-      if (result.orphanStorageKey) {
-        try { await this.storage.remove(result.orphanStorageKey); } catch (cleanupError) {
-          this.logger.error?.(`Deduplicated blob cleanup failed: ${cleanupError.message}`);
-        }
-      }
       return { ...result, deduplicated: result.deduplicated };
     } catch (error) {
       if (stage) {
@@ -397,9 +498,6 @@ class AttachmentService {
           this.logger.error?.(`Attachment staging cleanup failed: ${cleanupError.message}`);
         }
       }
-      // commitStaged exposes a post-rename destination even when its first
-      // best-effort unlink failed. Retry through the validated storage API; if
-      // this also fails, startup orphan reconciliation still sees the key.
       if (!committed && error?.destinationStorageKey) {
         try { await this.storage.remove(error.destinationStorageKey); } catch (cleanupError) {
           this.logger.error?.(
@@ -407,10 +505,7 @@ class AttachmentService {
           );
         }
       }
-      // A committed candidate that was not transactionally referenced is an
-      // orphan and can be removed. If the DB transaction did commit, the
-      // attempt is no longer STARTED and startup reconciliation preserves it.
-      if (committed && attempt) {
+      if (committed && !archiveFinalized && attempt) {
         const currentAttempt = this.repositories.attachments.listAttempts(attachmentId)
           .find((row) => row.id === attempt.id);
         if (currentAttempt?.status === 'STARTED') {
@@ -431,7 +526,6 @@ class AttachmentService {
             now: this.now(),
           });
         } catch (persistError) {
-          // A success transaction may have won just before a post-commit error.
           const current = this.repositories.attachments.listAttempts(attachmentId)
             .find((row) => row.id === attempt.id);
           if (current?.status !== 'SUCCEEDED') {
@@ -440,6 +534,25 @@ class AttachmentService {
         }
       }
       throw error;
+    } finally {
+      // The duplicate candidate is never canonical after the DOWNLOAD
+      // transaction commits. Parsing success must not control its lifecycle.
+      if (duplicateOrphanStorageKey) {
+        try {
+          await this.storage.remove(duplicateOrphanStorageKey);
+        } catch (cleanupError) {
+          this.logger.error?.(`Deduplicated blob cleanup failed: ${cleanupError.message}`);
+          try {
+            const liveKeys = this.repositories.attachments.listBlobs().flatMap((blob) => [
+              blob.storage_key,
+              ...(blob.promotion_target_key ? [blob.promotion_target_key] : []),
+            ]);
+            await this.storage.cleanupOrphans(liveKeys, { logger: this.logger });
+          } catch (reconcileError) {
+            this.logger.error?.(`Deduplicated blob reconciliation failed: ${reconcileError.message}`);
+          }
+        }
+      }
     }
   }
 
@@ -570,6 +683,39 @@ class AttachmentService {
     if (!purged) return { removed: false, reason: 'INELIGIBLE_OR_MISSING' };
     await this.storage.remove(purged.blob.storage_key);
     return { removed: true, ...purged };
+  }
+
+  async purgeExpiredTemporary(options = {}) {
+    const now = options.now ?? this.now();
+    if (!Number.isSafeInteger(now) || now < 0) throw new TypeError('purge now must be a timestamp');
+    const days = options.days ?? this.temporaryRetentionDays;
+    if (!Number.isSafeInteger(days) || days < 1 || days > 3650) {
+      throw new TypeError('purge days must be an integer from 1 to 3650');
+    }
+    const retentionMs = days * 24 * 60 * 60 * 1000;
+    const cutoff = Math.max(0, now - retentionMs);
+    const purged = this.repositories.attachments.purgeExpiredTemporary(cutoff, now);
+    const removedStorageKeys = [];
+    const errors = [];
+    for (const blob of purged.blobs) {
+      try {
+        await this.storage.remove(blob.storage_key);
+        removedStorageKeys.push(blob.storage_key);
+      } catch (error) {
+        errors.push({
+          storageKey: blob.storage_key,
+          code: error?.code || 'DISK_CLEANUP_FAILED',
+          message: String(error?.message || error),
+        });
+      }
+    }
+    return {
+      cutoff,
+      attachmentIds: purged.attachmentIds,
+      removedBlobHashes: purged.blobs.map((blob) => blob.sha256),
+      removedStorageKeys,
+      errors,
+    };
   }
 
   async _promoteBlobForAttachment(input) {
