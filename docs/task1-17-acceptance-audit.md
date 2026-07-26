@@ -152,5 +152,5 @@
 1. 在服务器本地提供并核对 `PM_AUTHORIZED_GROUP_JID`、`PM_ERIC_JID`、`PM_ADMIN_JIDS`；
 2. 决定是否配置可选 `PM_BACKUP_OFFSITE_DIR`；
 3. 在真实授权群执行角色、附件、摘要和 legacy command 验收；
-4. 受控执行并观察 PM2 restart、补报、数据持久性及 news/fitness/FX schedules；
+4. 受控执行并观察 PM2 restart、补报、数据持久性及 news/fitness schedules；
 5. 对生产上线/回滚点进行人工签收。

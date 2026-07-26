@@ -105,5 +105,5 @@ npm run preflight
 - Eric token 确认、成员 resolve、管理员 archive 权限正确；
 - 普通 Markdown 出现在 `!summary 4h`；
 - PM2 再次受控重启后，无重复工单/重复已发送摘要，漏报恢复正常；
-- legacy 命令以及 news/fitness/FX schedules 无回归；
+- legacy 命令以及 news/fitness schedules 无回归；
 - 记录恢复使用的 commit、bundle、时间和结果，不记录秘密。

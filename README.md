@@ -1,6 +1,6 @@
 # WSB WhatsApp Bot
 
-WSB 是一个基于 `whatsapp-web.js` 的 CommonJS WhatsApp Bot。除原有新闻、健身、汇率、网站生成和智能回复外，它还为一个明确授权的群提供 Tevau PM 工单、附件归档、群聊/Markdown 摘要、持久定时报告、保留清理和可验证备份。
+WSB 是一个基于 `whatsapp-web.js` 的 CommonJS WhatsApp Bot。除原有新闻、健身、网站生成和智能回复外，它还为一个明确授权的群提供 Tevau PM 工单、附件归档、群聊/Markdown 摘要、持久定时报告、保留清理和可验证备份。
 
 PM 数据保存在 SQLite；授权使用 WhatsApp runtime JID，不使用显示名。默认测试完全离线，不连接 WhatsApp、OpenRouter 或外部 OCR。
 

@@ -90,7 +90,7 @@ specs:
   - Acceptance Criteria:
     - `chatJid`、`senderJid`、serialized message ID、UTC 时间和 quoted ID 规范化正确，不使用显示名授权。
     - 重复投递或重启后重投同一命令只产生一次业务副作用。
-    - 现有 legacy commands、smart reply、clarification、cache、broadcast、news/fitness/FX 行为仍可调用。
+    - 现有 legacy commands、smart reply、clarification、cache、broadcast、news/fitness 行为仍可调用。
     - 发送文字、分段消息和归档附件均通过可 mock 的 adapter。
   - Steps:
     1. 新建 `whatsapp/normalize-message.js` 和 `whatsapp/adapter.js`。
@@ -282,7 +282,7 @@ specs:
     - 覆盖 add → AI 匹配 → Eric 确认 → resolve → archive、5+ 并行问题、Markdown 总结、重启补报和附件重发。
     - `docs/pm-member-guide.md`、`docs/pm-eric-card.md`、`docs/pm-admin-guide.md`、`docs/pm-recovery.md` 与 `!pm help` 命令一致。
     - README 说明 Node、配置、migration、备份、数据保留及故障降级。
-    - 真实授权群完成验收，现有 WSB 命令及 news/fitness/FX schedules 无回归，PM2 重启后数据和任务恢复。
+    - 真实授权群完成验收，现有 WSB 命令及 news/fitness schedules 无回归，PM2 重启后数据和任务恢复。
   - Steps:
     1. 将已有 assert scripts 迁移或接入 Node test runner。
     2. 建立 fake WhatsApp、fake clock、mock AI 和临时数据库端到端 harness。

@@ -82,6 +82,6 @@ npm run db:restore-check -- /absolute/path/to/wsb-YYYYMMDDTHHMMSSmmmZ-xxxxxxxx
 3. 根据 `docs/pm-live-acceptance.md` 在授权群完成值核对。
 4. 只重启指定应用：`pm2 restart whatsapp-bot --update-env`。
 5. 观察 ready、migration、定时任务注册、启动补报和错误日志；不要连续重复 restart。
-6. 验收旧命令、news/fitness/FX schedule、PM 流程和数据重启恢复。
+6. 验收旧命令、news/fitness schedules、PM 流程和数据重启恢复。
 
 回滚时先阻止新写入并备份现场，再切回记录的良好 commit、安装其 lockfile 依赖并执行该版本兼容的检查。数据库 migration 默认向前；未经恢复演练，不要直接降级数据库文件。需要回退数据时，只能使用上线前已验证 bundle，并按恢复文档操作。

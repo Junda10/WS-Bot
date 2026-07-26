@@ -74,7 +74,7 @@ function loadConfig(env = process.env) {
       message: env.AUTO_REPLY_MESSAGE || 'ok',
     },
 
-    // Existing news, fitness and FX schedules remain independent from PM reports.
+    // Existing news and fitness schedules remain independent from PM reports.
     scheduleHour: readInteger(env, 'SCHEDULE_HOUR', 8),
     scheduleMinute: readInteger(env, 'SCHEDULE_MINUTE', 0),
     scheduleTz: env.SCHEDULE_TZ || 'Asia/Kuala_Lumpur',
@@ -84,14 +84,6 @@ function loadConfig(env = process.env) {
       hour: readInteger(env, 'FITNESS_HOUR', 12),
       minute: readInteger(env, 'FITNESS_MINUTE', 0),
       target: env.FITNESS_TARGET || '',
-    },
-
-    fx: {
-      enabled: readBoolean(env, 'FX_ENABLED', true),
-      hour: readInteger(env, 'FX_HOUR', 20),
-      minute: readInteger(env, 'FX_MINUTE', 0),
-      target: env.FX_TARGET || '',
-      ai: readBoolean(env, 'FX_AI', true),
     },
 
     websiteWhitelist: normalizeJidList(env.WEBSITE_WHITELIST),
@@ -236,10 +228,6 @@ function validateConfig(config, { requirePm = true } = {}) {
   validBoolean(config.fitness.enabled, 'FITNESS_ENABLED');
   integerInRange(config.fitness.hour, 0, 23, 'FITNESS_HOUR');
   integerInRange(config.fitness.minute, 0, 59, 'FITNESS_MINUTE');
-  validBoolean(config.fx.enabled, 'FX_ENABLED');
-  validBoolean(config.fx.ai, 'FX_AI');
-  integerInRange(config.fx.hour, 0, 23, 'FX_HOUR');
-  integerInRange(config.fx.minute, 0, 59, 'FX_MINUTE');
 
   integerInRange(config.smartReply.debounceMs, 0, 10 * 60 * 1000, 'SMART_REPLY_DEBOUNCE_MS');
   integerInRange(config.smartReply.replyDelayBaseMs, 0, 60 * 1000, 'REPLY_DELAY_BASE_MS');

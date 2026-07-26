@@ -24,4 +24,4 @@ Fix the stored XSS vulnerability in the generated-site index and prevent persona
 - `git diff --check`
 
 ## Notes
-Existing unrelated uncommitted fitness, FX, conversation-history, and Claude-agent work was preserved and excluded from this commit. Existing legacy cache entries are not used by scoped smart-reply lookups, preventing old personalized replies from leaking.
+Existing unrelated uncommitted fitness, conversation-history, and Claude-agent work was preserved and excluded from this commit. Existing legacy cache entries are not used by scoped smart-reply lookups, preventing old personalized replies from leaking.

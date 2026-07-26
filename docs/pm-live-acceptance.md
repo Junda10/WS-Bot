@@ -118,7 +118,6 @@
 - [ ] 经许可测试 `!ask`、`!translate`、`!weather`、`!fitness`；白名单管理命令不扩大权限。
 - [ ] 日报 news schedule 仍按 `SCHEDULE_TZ` 注册一次。
 - [ ] fitness schedule 仍按配置时间/目标注册一次。
-- [ ] FX schedule 仍按配置时间/目标注册一次。
 - [ ] PM 报告的 10:00、14:00、20:00 schedule 使用 `PM_TIMEZONE` 且只注册一次。
 
 ## 8. PM2 重启、补报与持久性
@@ -130,7 +129,7 @@
 - [ ] 重投重启前命令不产生重复业务副作用。
 - [ ] 构造/等待一个受控 partial summary 后重启，只恢复未确认 part；已发送 part 不重复。
 - [ ] 过去 24 小时无漏报时不补；漏一份补原窗口；漏多份时明确标记合并延迟报告。
-- [ ] 再次 ready/reconnect 不重复注册 PM、news、fitness、FX schedules。
+- [ ] 再次 ready/reconnect 不重复注册 PM、news、fitness schedules。
 
 ## 9. 备份、观察与签收
 

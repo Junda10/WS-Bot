@@ -2,7 +2,7 @@ const axios = require('axios');
 
 const API_KEY = process.env.OPENROUTER_API_KEY;
 
-// OpenRouter GLM/Z.AI fallback chain (聊天、智能回复、新闻总结、汇率分析都统一走这里)。
+// OpenRouter GLM/Z.AI fallback chain (聊天、智能回复和新闻总结统一走这里)。
 // Keep OpenRouter as provider because deployment uses an OpenRouter key, but avoid
 // the weaker free-model chain for normal replies.
 // OPENROUTER_MODEL can be set in .env to force a preferred first choice.

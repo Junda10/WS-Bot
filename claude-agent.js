@@ -1,5 +1,5 @@
 // claude-agent.js — 本机 Claude CLI 调用（headless）
-// 把“分析类”任务（汇率走势、需要更准的推理）从 OpenRouter 免费模型切到 Claude/Sonnet。
+// 把需要更准确推理的分析任务从 OpenRouter 免费模型切到 Claude/Sonnet。
 // 聊天/智能回复仍走 OpenRouter（见 ai.js），互不影响。
 //
 // 前提：本机装了 claude CLI 且已登录（~/.claude/.credentials.json），pm2 与 CLI 同一用户。

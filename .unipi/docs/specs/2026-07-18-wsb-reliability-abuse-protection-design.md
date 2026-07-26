@@ -17,7 +17,7 @@ WSB 将作为公开 WhatsApp 机器人运行，任何人都可以使用主要功
 - WSB 是单进程 Node.js CommonJS 应用，由 PM2 管理，通过 `whatsapp-web.js` 接收消息。
 - AI 请求由 `ai.js` 直接调用 OpenRouter，并按模型列表串行 fallback；所有调用共享部署密钥。
 - 当前仅按用户序列化智能回复，没有全局并发上限、有限队列、每日预算或统一限流。
-- `ready` 事件每次都会重新注册新闻、健身和汇率 cron；重新连接可能造成重复发送。
+- `ready` 事件每次都会重新注册新闻和健身 cron；重新连接可能造成重复发送。
 - `disconnected` 只安排一次重新初始化；失败后进程可能保持 online 但不再服务。
 - memory、cache、autoreply 和 session 使用本地 JSON；部分模块直接覆盖文件并把读取失败当成空状态。
 - `!remind` 只使用进程内 timer，PM2 重启后丢失。
@@ -56,7 +56,7 @@ Policy Guard 根据发送者、聊天和功能类别返回 `allow`、`degrade` �
 | 类别 | 示例 | 默认策略 |
 |---|---|---|
 | 低成本公开功能 | `!help`、静态健身计划 | 公开，仅做宽松防刷屏 |
-| 外部网络功能 | 天气、新闻抓取、汇率 | 公开，独立网络限流与 timeout |
+| 外部网络功能 | 天气、新闻抓取 | 公开，独立网络限流与 timeout |
 | AI/高资源功能 | 智能回复、`!ask`、翻译、新闻总结、偏好提取、澄清、建站 | 每用户限流、全局并发、队列和预算控制 |
 | 敏感管理功能 | `!groups`、广播、建站、删除网站、自动回复管理 | owner 或明确白名单；额度不能替代授权 |
 
@@ -107,7 +107,7 @@ Policy Guard 根据发送者、聊天和功能类别返回 `allow`、`degrade` �
 
 - 成为唯一 OpenRouter 调用入口。
 - 实施全局并发、有限公平队列、排队超时、模型降级和 fallback 停止条件。
-- 普通聊天、新闻总结、偏好提取、澄清、汇率分析和建站均不得绕过。
+- 普通聊天、新闻总结、偏好提取、澄清和建站均不得绕过。
 
 #### `lib/atomic-json.js`
 
@@ -185,7 +185,7 @@ WhatsApp 消息
 - [ ] 实现 `protection/usage-ledger.js` 的每日 US$3 预算、预留/结算/释放和跨重启恢复测试
 - [ ] 实现 `protection/policy.js` 的功能分类、敏感授权、owner 规则和用户提示映射
 - [ ] 实现 `protection/ai-executor.js` 的并发 2、队列 20、公平调度、30 秒超时和预算阶段降级
-- [ ] 将 `ai.js` 的所有 OpenRouter 路径迁移到 AI executor，确保新闻、偏好、澄清、汇率和建站无绕过入口
+- [ ] 将 `ai.js` 的所有 OpenRouter 路径迁移到 AI executor，确保新闻、偏好、澄清和建站无绕过入口
 - [ ] 在 `index.js` 命令与智能回复入口统一接入 Policy Guard，并限制 `!groups` 等敏感功能
 - [ ] 实现 `lifecycle.js` 的幂等 cron、持续指数退避重连和 15 分钟离线 watchdog
 - [ ] 将 memory、cache、autoreply 和 session 持久化迁移到 `atomic-json`
