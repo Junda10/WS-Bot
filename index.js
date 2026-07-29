@@ -120,11 +120,13 @@ const workout = require('./workout');
 const history = require('./history');
 const { createMessageDeduper } = require('./message-deduper');
 
-history.configure({
-  repositories,
-  authorizedGroupJid: config.pm.enabled ? config.pm.authorizedGroupJid : null,
-  clock: appClock,
-});
+if (pmEnabled) {
+  history.configure({
+    repositories,
+    authorizedGroupJid: config.pm.authorizedGroupJid,
+    clock: appClock,
+  });
+}
 
 // Admin who approves auto-replying to new numbers. Set AUTOREPLY_ADMIN in .env
 // (full international number, e.g. 60XXXXXXXXX; a leading-0 local MY number is
