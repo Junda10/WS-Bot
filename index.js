@@ -51,57 +51,60 @@ let repositories;
 let permissionService;
 let issueService;
 let authorizedChat;
-try {
-  database = getDatabase({
-    filename: config.database.path,
-    busyTimeoutMs: config.database.busyTimeoutMs,
-  });
-  const migrationResult = migrateDatabase(database);
-  repositories = createRepositories(database);
-  authorizedChat = repositories.chats.findByJid(config.pm.authorizedGroupJid, {
-    includeDeleted: true,
-  });
-  if (!authorizedChat) {
-    authorizedChat = repositories.chats.create({
-      jid: config.pm.authorizedGroupJid,
-      timezone: config.reports.timezone,
-      now: Date.now(),
-    }).record;
-  }
-  permissionService = new PermissionService({
-    repositories,
-    authorizedChatJid: config.pm.authorizedGroupJid,
-    ericJid: config.pm.ericJid,
-  });
-  // Eric/admin identities are deployment configuration, not display names. Seed
-  // their durable roles idempotently so command authorization works immediately.
-  repositories.transaction((tx) => {
-    const now = appClock();
-    for (const roleInput of [
-      { jid: config.pm.ericJid, role: 'MEMBER' },
-      { jid: config.pm.ericJid, role: 'ERIC' },
-      ...config.pm.adminJids.map((jid) => ({ jid, role: 'ADMIN' })),
-    ]) {
-      if (!tx.permissions.hasRole(authorizedChat.id, roleInput.jid, roleInput.role)) {
-        tx.permissions.set({
-          chatId: authorizedChat.id,
-          canonicalJid: roleInput.jid,
-          role: roleInput.role,
-          now,
-        });
-      }
+const pmEnabled = config.pm.enabled;
+if (pmEnabled) {
+  try {
+    database = getDatabase({
+      filename: config.database.path,
+      busyTimeoutMs: config.database.busyTimeoutMs,
+    });
+    const migrationResult = migrateDatabase(database);
+    repositories = createRepositories(database);
+    authorizedChat = repositories.chats.findByJid(config.pm.authorizedGroupJid, {
+      includeDeleted: true,
+    });
+    if (!authorizedChat) {
+      authorizedChat = repositories.chats.create({
+        jid: config.pm.authorizedGroupJid,
+        timezone: config.reports.timezone,
+        now: Date.now(),
+      }).record;
     }
-  });
-  issueService = new IssueService({
-    repositories,
-    permissionService,
-    clock: appClock,
-  });
-  console.log(`🗄️ SQLite ready (schema version ${migrationResult.currentVersion})`);
-} catch (error) {
-  closeDatabase(database);
-  console.error(`❌ Startup database migration failed: ${error.message}`);
-  process.exit(1);
+    permissionService = new PermissionService({
+      repositories,
+      authorizedChatJid: config.pm.authorizedGroupJid,
+      ericJid: config.pm.ericJid,
+    });
+    repositories.transaction((tx) => {
+      const now = appClock();
+      for (const roleInput of [
+        { jid: config.pm.ericJid, role: 'MEMBER' },
+        { jid: config.pm.ericJid, role: 'ERIC' },
+        ...config.pm.adminJids.map((jid) => ({ jid, role: 'ADMIN' })),
+      ]) {
+        if (!tx.permissions.hasRole(authorizedChat.id, roleInput.jid, roleInput.role)) {
+          tx.permissions.set({
+            chatId: authorizedChat.id,
+            canonicalJid: roleInput.jid,
+            role: roleInput.role,
+            now,
+          });
+        }
+      }
+    });
+    issueService = new IssueService({
+      repositories,
+      permissionService,
+      clock: appClock,
+    });
+    console.log(`🗄️ SQLite ready (schema version ${migrationResult.currentVersion})`);
+  } catch (error) {
+    closeDatabase(database);
+    console.error(`❌ Startup database migration failed: ${error.message}`);
+    process.exit(1);
+  }
+} else {
+  console.log('ℹ️ PM 模块已禁用 (PM_ENABLED=false)，跳过数据库和 PM 初始化');
 }
 
 const { fetchNews, formatNewsMessage, getAllNews } = require('./news-fetcher');
@@ -119,7 +122,7 @@ const { createMessageDeduper } = require('./message-deduper');
 
 history.configure({
   repositories,
-  authorizedGroupJid: config.pm.authorizedGroupJid,
+  authorizedGroupJid: config.pm.enabled ? config.pm.authorizedGroupJid : null,
   clock: appClock,
 });
 
@@ -143,159 +146,187 @@ const client = new Client({
   },
 });
 const whatsappAdapter = new WhatsAppAdapter({ client });
-const attachmentStorage = new AttachmentStorage({
-  rootDir: config.storage.attachmentsDir,
-  tempDir: config.storage.tempDir,
-});
-const attachmentQueue = new AttachmentProcessingQueue({
-  concurrency: 1,
-  maxPending: config.storage.maxQueuePending,
-});
-const ocrWorkerService = new OcrWorkerService({
-  languages: config.media.ocrLanguages,
-  cachePath: config.media.ocrCachePath,
-  langPath: config.media.ocrLangPath,
-  timeoutMs: config.media.ocrRecognizeTimeoutMs,
-  initializeTimeoutMs: config.media.ocrInitializeTimeoutMs,
-  shutdownTimeoutMs: config.media.ocrShutdownTimeoutMs,
-  logger: console,
-});
-const attachmentOcrService = new AttachmentOcrService({ worker: ocrWorkerService });
-const attachmentExtractor = new AttachmentExtractionProcessor({
-  ocrService: attachmentOcrService,
-});
-const attachmentService = new AttachmentService({
-  repositories,
-  permissionService,
-  issueService,
-  storage: attachmentStorage,
-  queue: attachmentQueue,
-  adapter: whatsappAdapter,
-  extractor: attachmentExtractor,
-  limits: { ...config.storage, ...config.media },
-  temporaryRetentionDays: config.retention.messageDays,
-  clock: appClock,
-});
-const pmAiService = new PmAiService({
-  aiClient: require('./ai'),
-  issueRepository: repositories.issues,
-  now: appClock,
-});
-const pmAddService = new PmAddService({
-  repositories,
-  permissionService,
-  issueService,
-  attachmentService,
-  aiService: pmAiService,
-  attachmentWaitMs: config.storage.processingTimeoutMs + 5000,
-});
-const pmReplyService = new PmReplyService({
-  repositories,
-  permissionService,
-  issueService,
-  aiService: pmAiService,
-  ttlMs: config.pm.replySessionTtlMs,
-  clock: appClock,
-});
-const pmHandlers = createPmCommandHandlers({
-  issueService,
-  permissionService,
-  attachmentService,
-  pmAddService,
-  pmReplyService,
-  adapter: whatsappAdapter,
-  attachmentsDir: config.storage.attachmentsDir,
-  clock: appClock,
-});
-const conversationSummaryService = new ConversationSummaryService({
-  repositories,
-  aiService: pmAiService,
-  timezone: config.reports.timezone,
-});
-const manualSummaryService = new ManualSummaryService({
-  repositories,
-  conversationService: conversationSummaryService,
-  timezone: config.reports.timezone,
-  maxHours: config.reports.maxManualHours,
-  maxSinceDays: config.retention.messageDays,
-});
-const summaryHandler = createSummaryHandler({
-  summaryService: manualSummaryService,
-  adapter: whatsappAdapter,
-});
-const scheduledSummaryService = new ScheduledSummaryService({
-  repositories,
-  conversationService: conversationSummaryService,
-  timezone: config.reports.timezone,
-});
+
+let attachmentStorage = null;
+let attachmentQueue = null;
+let ocrWorkerService = null;
+let attachmentOcrService = null;
+let attachmentExtractor = null;
+let attachmentService = null;
+let pmAiService = null;
+let pmAddService = null;
+let pmReplyService = null;
+let pmHandlers = null;
+let conversationSummaryService = null;
+let manualSummaryService = null;
+let summaryHandler = null;
+let scheduledSummaryService = null;
 let whatsappReady = false;
-const persistentSummaryRunner = new PersistentSummaryRunner({
-  repositories,
-  summaryService: scheduledSummaryService,
-  adapter: whatsappAdapter,
-  chat: authorizedChat,
-  timezone: config.reports.timezone,
-  clock: appClock,
-  logger: console,
-});
-const summaryRecoveryService = new SummaryRecoveryService({
-  repositories,
-  runner: persistentSummaryRunner,
-  chat: authorizedChat,
-  adapterReady: () => whatsappReady,
-  timezone: config.reports.timezone,
-  recoveryHours: config.reports.recoveryWindowHours,
-  clock: appClock,
-  logger: console,
-});
-const persistentSummaryScheduler = new PersistentSummaryScheduler({
-  cron,
-  runner: persistentSummaryRunner,
-  recovery: summaryRecoveryService,
-  timezone: config.reports.timezone,
-  logger: console,
-});
-const retentionService = new RetentionService({
-  db: database,
-  repositories,
-  storage: attachmentStorage,
-  messageDays: config.retention.messageDays,
-  replySessionGraceMs: config.retention.replySessionGraceMs,
-  tempFileGraceMs: config.retention.tempFileGraceMs,
-  clock: appClock,
-  logger: console,
-});
-const offsiteBackupAdapter = config.backup.offsiteDirectory
-  ? new FilesystemOffsiteAdapter({
-    destinationDir: config.backup.offsiteDirectory,
+let persistentSummaryRunner = null;
+let summaryRecoveryService = null;
+let persistentSummaryScheduler = null;
+let retentionService = null;
+let backupService = null;
+let maintenanceScheduler = null;
+let namespacedCommandRouter = null;
+let attachmentRecoveryComplete = false;
+let attachmentRecoveryPromise = null;
+let attachmentRecoveryRetryTimer = null;
+
+if (pmEnabled) {
+  attachmentStorage = new AttachmentStorage({
+    rootDir: config.storage.attachmentsDir,
+    tempDir: config.storage.tempDir,
+  });
+  attachmentQueue = new AttachmentProcessingQueue({
+    concurrency: 1,
+    maxPending: config.storage.maxQueuePending,
+  });
+  ocrWorkerService = new OcrWorkerService({
+    languages: config.media.ocrLanguages,
+    cachePath: config.media.ocrCachePath,
+    langPath: config.media.ocrLangPath,
+    timeoutMs: config.media.ocrRecognizeTimeoutMs,
+    initializeTimeoutMs: config.media.ocrInitializeTimeoutMs,
+    shutdownTimeoutMs: config.media.ocrShutdownTimeoutMs,
+    logger: console,
+  });
+  attachmentOcrService = new AttachmentOcrService({ worker: ocrWorkerService });
+  attachmentExtractor = new AttachmentExtractionProcessor({
+    ocrService: attachmentOcrService,
+  });
+  attachmentService = new AttachmentService({
+    repositories,
+    permissionService,
+    issueService,
+    storage: attachmentStorage,
+    queue: attachmentQueue,
+    adapter: whatsappAdapter,
+    extractor: attachmentExtractor,
+    limits: { ...config.storage, ...config.media },
+    temporaryRetentionDays: config.retention.messageDays,
+    clock: appClock,
+  });
+  pmAiService = new PmAiService({
+    aiClient: require('./ai'),
+    issueRepository: repositories.issues,
+    now: appClock,
+  });
+  pmAddService = new PmAddService({
+    repositories,
+    permissionService,
+    issueService,
+    attachmentService,
+    aiService: pmAiService,
+    attachmentWaitMs: config.storage.processingTimeoutMs + 5000,
+  });
+  pmReplyService = new PmReplyService({
+    repositories,
+    permissionService,
+    issueService,
+    aiService: pmAiService,
+    ttlMs: config.pm.replySessionTtlMs,
+    clock: appClock,
+  });
+  pmHandlers = createPmCommandHandlers({
+    issueService,
+    permissionService,
+    attachmentService,
+    pmAddService,
+    pmReplyService,
+    adapter: whatsappAdapter,
+    attachmentsDir: config.storage.attachmentsDir,
+    clock: appClock,
+  });
+  conversationSummaryService = new ConversationSummaryService({
+    repositories,
+    aiService: pmAiService,
+    timezone: config.reports.timezone,
+  });
+  manualSummaryService = new ManualSummaryService({
+    repositories,
+    conversationService: conversationSummaryService,
+    timezone: config.reports.timezone,
+    maxHours: config.reports.maxManualHours,
+    maxSinceDays: config.retention.messageDays,
+  });
+  summaryHandler = createSummaryHandler({
+    summaryService: manualSummaryService,
+    adapter: whatsappAdapter,
+  });
+  scheduledSummaryService = new ScheduledSummaryService({
+    repositories,
+    conversationService: conversationSummaryService,
+    timezone: config.reports.timezone,
+  });
+  persistentSummaryRunner = new PersistentSummaryRunner({
+    repositories,
+    summaryService: scheduledSummaryService,
+    adapter: whatsappAdapter,
+    chat: authorizedChat,
+    timezone: config.reports.timezone,
+    clock: appClock,
+    logger: console,
+  });
+  summaryRecoveryService = new SummaryRecoveryService({
+    repositories,
+    runner: persistentSummaryRunner,
+    chat: authorizedChat,
+    adapterReady: () => whatsappReady,
+    timezone: config.reports.timezone,
+    recoveryHours: config.reports.recoveryWindowHours,
+    clock: appClock,
+    logger: console,
+  });
+  persistentSummaryScheduler = new PersistentSummaryScheduler({
+    cron,
+    runner: persistentSummaryRunner,
+    recovery: summaryRecoveryService,
+    timezone: config.reports.timezone,
+    logger: console,
+  });
+  retentionService = new RetentionService({
+    db: database,
+    repositories,
+    storage: attachmentStorage,
+    messageDays: config.retention.messageDays,
+    replySessionGraceMs: config.retention.replySessionGraceMs,
+    tempFileGraceMs: config.retention.tempFileGraceMs,
+    clock: appClock,
+    logger: console,
+  });
+  const offsiteBackupAdapter = config.backup.offsiteDirectory
+    ? new FilesystemOffsiteAdapter({
+      destinationDir: config.backup.offsiteDirectory,
+      busyTimeoutMs: config.database.busyTimeoutMs,
+    })
+    : null;
+  backupService = new BackupService({
+    db: database,
+    databasePath: config.database.path,
+    attachmentsDir: config.storage.attachmentsDir,
+    backupDir: config.backup.directory,
+    retentionCount: config.backup.retentionCount,
     busyTimeoutMs: config.database.busyTimeoutMs,
-  })
-  : null;
-const backupService = new BackupService({
-  db: database,
-  databasePath: config.database.path,
-  attachmentsDir: config.storage.attachmentsDir,
-  backupDir: config.backup.directory,
-  retentionCount: config.backup.retentionCount,
-  busyTimeoutMs: config.database.busyTimeoutMs,
-  offsiteAdapter: offsiteBackupAdapter,
-  clock: appClock,
-  logger: console,
-});
-const maintenanceScheduler = new MaintenanceScheduler({
-  cron,
-  retention: retentionService,
-  backup: backupService,
-  expression: config.maintenance.cron,
-  timezone: config.maintenance.timezone,
-  logger: console,
-});
-const namespacedCommandRouter = createCommandRouter({
-  permissionService,
-  pmHandlers,
-  summaryHandler,
-  clock: appClock,
-});
+    offsiteAdapter: offsiteBackupAdapter,
+    clock: appClock,
+    logger: console,
+  });
+  maintenanceScheduler = new MaintenanceScheduler({
+    cron,
+    retention: retentionService,
+    backup: backupService,
+    expression: config.maintenance.cron,
+    timezone: config.maintenance.timezone,
+    logger: console,
+  });
+  namespacedCommandRouter = createCommandRouter({
+    permissionService,
+    pmHandlers,
+    summaryHandler,
+    clock: appClock,
+  });
+}
 
 const autoReplyTracker = new Map();
 const COOLDOWN_MS = 12 * 60 * 60 * 1000;
@@ -320,58 +351,51 @@ client.on('qr', (qr) => {
 
 let schedulesRegistered = false;
 const legacyCronTasks = [];
-let attachmentRecoveryComplete = false;
-let attachmentRecoveryPromise = null;
-let attachmentRecoveryRetryTimer = null;
 async function onWhatsAppReady() {
   console.log('✅ 机器人已连接!');
   whatsappReady = true;
 
-  // Authorized ingress starts closed. This makes it safe to reclaim every
-  // prior-process claim immediately, even when its old lease has not expired.
-  // Concurrent/repeated ready events share one recovery attempt; only a
-  // successful attempt opens ingress and permits schedule registration.
-  if (!attachmentRecoveryComplete) {
-    if (!attachmentRecoveryPromise) {
-      attachmentRecoveryPromise = Promise.resolve().then(() => {
-        const reclaimedMessages = repositories.messages.recoverProcessingForStartup(
-          authorizedChat.id,
-          appClock()
-        );
-        if (reclaimedMessages.length > 0) {
-          console.log(`💬 消息恢复：回收 ${reclaimedMessages.length} 个旧进程处理声明`);
-        }
-        return attachmentService.recoverPending();
-      }).then((recovery) => {
-        attachmentRecoveryComplete = true;
-        handleIncomingMessage.startAuthorizedIngress();
-        console.log(`📎 附件恢复：排队 ${recovery.queued.length}，入队失败 ${recovery.failedAdmissions.length}，孤儿清理 ${recovery.removedOrphans.length}`);
-        return recovery;
-      }).finally(() => {
-        attachmentRecoveryPromise = null;
-      });
-    }
-    try {
-      await attachmentRecoveryPromise;
-    } catch (error) {
-      console.error(`❌ 附件启动恢复失败: ${error.message}`);
-      if (!attachmentRecoveryRetryTimer) {
-        attachmentRecoveryRetryTimer = setTimeout(() => {
-          attachmentRecoveryRetryTimer = null;
-          onWhatsAppReady().catch((retryError) => {
-            console.error(`❌ 附件启动恢复重试失败: ${retryError.message}`);
-          });
-        }, 5000);
-        attachmentRecoveryRetryTimer.unref?.();
+  if (pmEnabled) {
+    if (!attachmentRecoveryComplete) {
+      if (!attachmentRecoveryPromise) {
+        attachmentRecoveryPromise = Promise.resolve().then(() => {
+          const reclaimedMessages = repositories.messages.recoverProcessingForStartup(
+            authorizedChat.id,
+            appClock()
+          );
+          if (reclaimedMessages.length > 0) {
+            console.log(`💬 消息恢复：回收 ${reclaimedMessages.length} 个旧进程处理声明`);
+          }
+          return attachmentService.recoverPending();
+        }).then((recovery) => {
+          attachmentRecoveryComplete = true;
+          handleIncomingMessage.startAuthorizedIngress();
+          console.log(`📎 附件恢复：排队 ${recovery.queued.length}，入队失败 ${recovery.failedAdmissions.length}，孤儿清理 ${recovery.removedOrphans.length}`);
+          return recovery;
+        }).finally(() => {
+          attachmentRecoveryPromise = null;
+        });
       }
-      return;
+      try {
+        await attachmentRecoveryPromise;
+      } catch (error) {
+        console.error(`❌ 附件启动恢复失败: ${error.message}`);
+        if (!attachmentRecoveryRetryTimer) {
+          attachmentRecoveryRetryTimer = setTimeout(() => {
+            attachmentRecoveryRetryTimer = null;
+            onWhatsAppReady().catch((retryError) => {
+              console.error(`❌ 附件启动恢复重试失败: ${retryError.message}`);
+            });
+          }, 5000);
+          attachmentRecoveryRetryTimer.unref?.();
+        }
+        return;
+      }
     }
-  }
 
-  // Persistent summary and maintenance registration are independently idempotent
-  // and start only after migrations, WhatsApp ready, and ingress recovery.
-  await persistentSummaryScheduler.start();
-  if (config.maintenance.enabled) maintenanceScheduler.start();
+    await persistentSummaryScheduler.start();
+    if (config.maintenance.enabled) maintenanceScheduler.start();
+  }
 
   if (schedulesRegistered) {
     console.log('ℹ️ 定时任务已注册，跳过重复 ready 初始化');
@@ -763,38 +787,46 @@ async function routeExistingMessage(message, normalized = null, persisted = null
   }
 }
 
-async function routeAuthorizedMessage(message, normalized, persisted) {
-  const commandResult = await namespacedCommandRouter.route(message, normalized, persisted);
-  if (commandResult.handled) return commandResult;
-  return routeExistingMessage(message, normalized, persisted);
-}
+let handleIncomingMessage = null;
+if (pmEnabled) {
+  async function routeAuthorizedMessage(message, normalized, persisted) {
+    const commandResult = await namespacedCommandRouter.route(message, normalized, persisted);
+    if (commandResult.handled) return commandResult;
+    return routeExistingMessage(message, normalized, persisted);
+  }
 
-const authorizedGroupIngress = new AuthorizedGroupIngress({
-  repositories,
-  permissionService,
-  route: routeAuthorizedMessage,
-  isDuplicate: isDuplicateMessage,
-  attachmentService,
-  clock: appClock,
-});
-const handleIncomingMessage = createMessageEventHandler({
-  ingress: authorizedGroupIngress,
-  adapter: whatsappAdapter,
-  routeLegacy: routeExistingMessage,
-  isDuplicate: isDuplicateMessage,
-  clock: appClock,
-  authorizedInitiallyAccepting: false,
-});
-function onClientMessage(message) {
-  handleIncomingMessage(message).catch((error) => {
-    if (error.code === 'CHAT_NOT_AUTHORIZED' || error.code === 'CHAT_DISABLED') {
-      console.warn(`⚠️ 忽略未授权或已停用的群聊消息 (${error.code})`);
-      return;
-    }
-    console.error(`WhatsApp message ingress failed: ${error.message}`);
+  const authorizedGroupIngress = new AuthorizedGroupIngress({
+    repositories,
+    permissionService,
+    route: routeAuthorizedMessage,
+    isDuplicate: isDuplicateMessage,
+    attachmentService,
+    clock: appClock,
+  });
+  handleIncomingMessage = createMessageEventHandler({
+    ingress: authorizedGroupIngress,
+    adapter: whatsappAdapter,
+    routeLegacy: routeExistingMessage,
+    isDuplicate: isDuplicateMessage,
+    clock: appClock,
+    authorizedInitiallyAccepting: false,
+  });
+  client.on('message', (message) => {
+    handleIncomingMessage(message).catch((error) => {
+      if (error.code === 'CHAT_NOT_AUTHORIZED' || error.code === 'CHAT_DISABLED') {
+        console.warn(`⚠️ 忽略未授权或已停用的群聊消息 (${error.code})`);
+        return;
+      }
+      console.error(`WhatsApp message ingress failed: ${error.message}`);
+    });
+  });
+} else {
+  client.on('message', (message) => {
+    routeExistingMessage(message).catch((error) => {
+      console.error(`WhatsApp message ingress failed: ${error.message}`);
+    });
   });
 }
-client.on('message', onClientMessage);
 
 // Anti-ban human pause: pace the reply like a human typing. The target delay scales
 // with the reply length (base thinking time + per-char typing time), is jittered, and
@@ -1066,9 +1098,9 @@ async function shutdown(signal) {
   shuttingDown = true;
   console.log(`🛑 ${signal} received, shutting down...`);
 
-  persistentSummaryScheduler.stop();
+  if (persistentSummaryScheduler) persistentSummaryScheduler.stop();
   try {
-    await maintenanceScheduler.stop();
+    if (maintenanceScheduler) await maintenanceScheduler.stop();
   } catch (error) {
     console.warn(`Maintenance shutdown failed: ${error.message}`);
   }
@@ -1085,54 +1117,57 @@ async function shutdown(signal) {
     clearTimeout(attachmentRecoveryRetryTimer);
     attachmentRecoveryRetryTimer = null;
   }
-  attachmentService.stopRecovery();
+  if (attachmentService) attachmentService.stopRecovery();
 
-  const summaryDrain = await persistentSummaryScheduler.drain({ timeoutMs: 10_000 });
-  if (summaryDrain.timedOut) {
-    console.warn(`Scheduled summary drain timed out with ${summaryDrain.remaining} run(s) still active`);
+  if (persistentSummaryScheduler) {
+    const summaryDrain = await persistentSummaryScheduler.drain({ timeoutMs: 10_000 });
+    if (summaryDrain.timedOut) {
+      console.warn(`Scheduled summary drain timed out with ${summaryDrain.remaining} run(s) still active`);
+    }
   }
   try {
-    await maintenanceScheduler.drain();
+    if (maintenanceScheduler) await maintenanceScheduler.drain();
   } catch (error) {
     console.warn(`Maintenance drain failed: ${error.message}`);
   }
 
-  // Stop admission first, then let accepted handlers finish their durable
-  // PROCESSED/FAILED transition before either transport or database disappears.
-  handleIncomingMessage.stopAccepting();
-  attachmentQueue.stopAccepting();
+  if (handleIncomingMessage) handleIncomingMessage.stopAccepting();
+  if (attachmentQueue) attachmentQueue.stopAccepting();
   smartReplyScheduler.stopAccepting();
   const cancelled = smartReplyScheduler.cancelPending();
   if (cancelled > 0) {
     console.log(`🛑 Cancelled ${cancelled} queued smart repl${cancelled === 1 ? 'y' : 'ies'}`);
   }
-  client.off?.('message', onClientMessage);
   try {
-    const drain = await handleIncomingMessage.drain({ timeoutMs: 10_000 });
-    if (drain.timedOut) {
-      // Do not hang process shutdown forever on an unavailable AI/transport call.
-      // Its durable PROCESSING lease remains retryable after expiry.
-      console.warn(`WhatsApp ingress drain timed out with ${drain.remaining} handler(s) still active; forcing bounded shutdown`);
+    if (handleIncomingMessage) {
+      const drain = await handleIncomingMessage.drain({ timeoutMs: 10_000 });
+      if (drain.timedOut) {
+        console.warn(`WhatsApp ingress drain timed out with ${drain.remaining} handler(s) still active; forcing bounded shutdown`);
+      }
     }
     const smartReplyDrain = await smartReplyScheduler.drain({
-      timeoutMs: drain.timedOut ? 0 : 10_000,
+      timeoutMs: 10_000,
     });
     if (smartReplyDrain.timedOut) {
       console.warn(`Smart-reply drain timed out with ${smartReplyDrain.remaining} operation(s) still active`);
     }
-    const attachmentDrain = await attachmentQueue.drain({
-      timeoutMs: drain.timedOut ? 0 : 10_000,
-    });
-    if (attachmentDrain.timedOut) {
-      console.warn(`Attachment queue drain timed out with ${attachmentDrain.active} active and ${attachmentDrain.pending} pending`);
+    if (attachmentQueue) {
+      const attachmentDrain = await attachmentQueue.drain({
+        timeoutMs: 10_000,
+      });
+      if (attachmentDrain.timedOut) {
+        console.warn(`Attachment queue drain timed out with ${attachmentDrain.active} active and ${attachmentDrain.pending} pending`);
+      }
     }
   } catch (error) {
     console.warn(`WhatsApp ingress drain failed: ${error.message}`);
   }
-  try {
-    await attachmentService.terminate();
-  } catch (error) {
-    console.warn(`OCR worker shutdown failed: ${error.message}`);
+  if (attachmentService) {
+    try {
+      await attachmentService.terminate();
+    } catch (error) {
+      console.warn(`OCR worker shutdown failed: ${error.message}`);
+    }
   }
 
   try {
@@ -1141,7 +1176,7 @@ async function shutdown(signal) {
     console.warn(`WhatsApp client shutdown failed: ${error.message}`);
   } finally {
     try {
-      closeDatabase(database);
+      if (database) closeDatabase(database);
     } catch (error) {
       console.warn(`Database shutdown failed: ${error.message}`);
     }
@@ -1151,11 +1186,10 @@ async function shutdown(signal) {
 
 process.once('SIGINT', () => shutdown('SIGINT'));
 process.once('SIGTERM', () => shutdown('SIGTERM'));
-process.once('exit', () => closeDatabase(database));
+process.once('exit', () => { if (database) closeDatabase(database); });
 
-// Database migration above must succeed before WhatsApp can initialize or emit ready.
 client.initialize().catch((error) => {
   console.error(`WhatsApp initialization failed: ${error.message}`);
-  closeDatabase(database);
+  if (database) closeDatabase(database);
   process.exitCode = 1;
 });

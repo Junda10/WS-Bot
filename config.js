@@ -107,6 +107,7 @@ function loadConfig(env = process.env) {
     },
 
     pm: {
+      enabled: readBoolean(env, 'PM_ENABLED', true),
       authorizedGroupJid: normalizeJid(env.PM_AUTHORIZED_GROUP_JID, { kind: 'group' }),
       ericJid: normalizeJid(env.PM_ERIC_JID),
       adminJids: normalizeJidList(env.PM_ADMIN_JIDS),
@@ -208,7 +209,8 @@ function validateConfig(config, { requirePm = true } = {}) {
     }
   };
 
-  if (requirePm) {
+  validBoolean(config.pm.enabled, 'PM_ENABLED');
+  if (requirePm && config.pm.enabled) {
     if (!config.pm.authorizedGroupJid) {
       errors.push('PM_AUTHORIZED_GROUP_JID is required and must end in @g.us');
     }
